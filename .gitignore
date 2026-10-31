@@ -40,7 +40,6 @@ frontend/dist/
 
 # Backend storage (generated at runtime)
 backend/storage/
-backend/app/assets/sample_properties/*.jpg
 backend/app/assets/audio/*.wav
 
 # Generated videos and temp files
