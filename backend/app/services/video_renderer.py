@@ -4,6 +4,7 @@ import subprocess
 import shutil
 import logging
 import math
+import re
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -17,6 +18,25 @@ from app.services.audio_service import AudioService
 logger = logging.getLogger(__name__)
 
 class VideoRenderer:
+    @staticmethod
+    def _probe_audio_duration(audio_path: Path, ffmpeg_bin: str) -> Optional[float]:
+        """Reads media duration from FFmpeg so speech can be kept inside its scene."""
+        try:
+            result = subprocess.run(
+                [ffmpeg_bin, "-hide_banner", "-i", str(audio_path), "-f", "null", "-"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+            if not match:
+                return None
+            hours, minutes, seconds = match.groups()
+            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        except Exception:
+            return None
+
     @staticmethod
     def _get_font(font_size: int, bold: bool = False, serif: bool = False) -> ImageFont.ImageFont:
         """
@@ -396,61 +416,104 @@ class VideoRenderer:
             if progress_callback:
                 progress_callback(80, "Mixing voiceover and ambient soundtrack")
 
-            vo_path = None
+            voiceover_tracks: List[Tuple[Path, float, float, float]] = []
             if prop.narration_enabled and settings.TTS_PROVIDER != "none":
-                vo_temp = temp_dir / "voiceover.mp3"
-                vo_path = asyncio.run(
-                    AudioService.generate_voiceover(
-                        storyboard.script.voiceover_full,
-                        vo_temp,
-                        voice=getattr(prop, "voice_accent", None)
-                    )
-                )
-                if not vo_path or not vo_path.is_file() or vo_path.stat().st_size <= 500:
-                    selected_voice = getattr(prop, "voice_accent", "en-US-BrianNeural")
-                    raise RuntimeError(
-                        f"Narration could not be generated for {selected_voice}. "
-                        "Check the internet connection or install a matching English system speech voice."
-                    )
+                scene_start = 0.0
+                for idx, scene in enumerate(storyboard.scenes):
+                    text = scene.voiceover_text.strip()
+                    if text:
+                        vo_temp = temp_dir / f"voiceover_scene_{idx}.mp3"
+                        vo_path = asyncio.run(
+                            AudioService.generate_voiceover(
+                                text,
+                                vo_temp,
+                                voice=getattr(prop, "voice_accent", None)
+                            )
+                        )
+                        if not vo_path or not vo_path.is_file() or vo_path.stat().st_size <= 500:
+                            selected_voice = getattr(prop, "voice_accent", "en-US-BrianNeural")
+                            raise RuntimeError(
+                                f"Narration could not be generated for {selected_voice}. "
+                                "Check the internet connection or install a matching English system speech voice."
+                            )
+                        audio_duration = cls._probe_audio_duration(vo_path, ffmpeg_bin) or scene.duration
+                        voiceover_tracks.append((vo_path, scene_start, audio_duration, scene.duration))
+                    scene_start += scene.duration
+
+                if not voiceover_tracks:
+                    raise RuntimeError("The script has no scene narration to synthesize.")
 
             bg_music_path = AudioService.get_background_music_path() if prop.music_enabled else None
 
             # Step 4: Final Muxing
             if progress_callback:
-                progress_callback(90, "Finalizing MP4 video container")
+                progress_callback(90, "Aligning scene narration and finalizing MP4")
 
             total_dur = storyboard.total_duration
-
-            # Build final FFmpeg mux command depending on audio tracks available
             final_cmd = [ffmpeg_bin, "-y", "-i", str(combined_video_path)]
+            voice_input_indexes = []
+            for vo_path, _, _, _ in voiceover_tracks:
+                voice_input_indexes.append(1 + len(voice_input_indexes))
+                final_cmd.extend(["-i", str(vo_path)])
 
-            if vo_path and bg_music_path:
-                # Both Narration and Background Music -> Mix with professional vocal presence and subtle ducking
+            bg_music_index = None
+            if bg_music_path:
+                bg_music_index = 1 + len(voice_input_indexes)
+                final_cmd.extend(["-stream_loop", "-1", "-i", str(bg_music_path)])
+
+            audio_filters = []
+            voice_labels = []
+            mix_input_count = len(voiceover_tracks) + (1 if bg_music_index is not None else 0)
+            for track_index, (input_index, track) in enumerate(zip(voice_input_indexes, voiceover_tracks)):
+                _, scene_start, audio_duration, scene_duration = track
+                usable_duration = max(0.25, scene_duration - 0.15)
+                speed_factor = max(1.0, audio_duration / usable_duration)
+                tempo_filters = []
+                while speed_factor > 2.0:
+                    tempo_filters.append("atempo=2.0")
+                    speed_factor /= 2.0
+                if speed_factor > 1.01:
+                    tempo_filters.append(f"atempo={speed_factor:.3f}")
+                tempo_chain = ",".join(tempo_filters)
+                if tempo_chain:
+                    tempo_chain += ","
+                delay_ms = max(0, round(scene_start * 1000))
+                label = f"vo{track_index}"
+                voice_labels.append(f"[{label}]")
+                audio_filters.append(
+                    f"[{input_index}:a]{tempo_chain}aformat=sample_rates=44100:channel_layouts=stereo,"
+                    f"volume={1.2 * mix_input_count:.3f},adelay={delay_ms}|{delay_ms},"
+                    f"apad,atrim=duration={total_dur}[{label}]"
+                )
+
+            if bg_music_index is not None:
+                music_start = max(0, total_dur - 2.5)
+                music_volume = 0.18 * mix_input_count if voice_labels else 0.35
+                audio_filters.append(
+                    f"[{bg_music_index}:a]aformat=sample_rates=44100:channel_layouts=stereo,"
+                    f"volume={music_volume:.3f},atrim=duration={total_dur},afade=t=in:ss=0:d=1,"
+                    f"afade=t=out:st={music_start}:d=2.5[bg]"
+                )
+                if voice_labels:
+                    audio_filters.append(
+                        f"[bg]{''.join(voice_labels)}amix=inputs={len(voice_labels) + 1}:"
+                        "duration=first:dropout_transition=0[mixed];[mixed]volume=0.8[aout]"
+                    )
+                else:
+                    audio_filters.append("[bg]anull[aout]")
+            elif len(voice_labels) == 1:
+                audio_filters.append(f"{voice_labels[0]}volume=0.8[aout]")
+            elif voice_labels:
+                audio_filters.append(
+                    f"{''.join(voice_labels)}amix=inputs={len(voice_labels)}:"
+                    "duration=first:dropout_transition=0[mixed];[mixed]volume=0.8[aout]"
+                )
+
+            if audio_filters:
                 final_cmd.extend([
-                    "-stream_loop", "-1", "-i", str(bg_music_path),
-                    "-i", str(vo_path),
-                    "-filter_complex",
-                    f"[1:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=0.18,afade=t=in:ss=0:d=1,afade=t=out:st={total_dur - 2.5}:d=2.5[bg];"
-                    f"[2:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=1.25[vo];"
-                    f"[bg][vo]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+                    "-filter_complex", ";".join(audio_filters),
                     "-map", "0:v",
                     "-map", "[aout]"
-                ])
-            elif bg_music_path:
-                # Background Music Only -> Fade in/out
-                final_cmd.extend([
-                    "-stream_loop", "-1", "-i", str(bg_music_path),
-                    "-filter_complex",
-                    f"[1:a]volume=0.35,afade=t=in:ss=0:d=1,afade=t=out:st={total_dur - 2.5}:d=2.5[aout]",
-                    "-map", "0:v",
-                    "-map", "[aout]"
-                ])
-            elif vo_path:
-                # Narration Only
-                final_cmd.extend([
-                    "-i", str(vo_path),
-                    "-map", "0:v",
-                    "-map", "1:a"
                 ])
             else:
                 # Silent MP4 -> Generate null stereo audio so players don't error

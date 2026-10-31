@@ -6,12 +6,13 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 from pathlib import Path
 
-from app.config import OUTPUT_DIR
+from app.config import OUTPUT_DIR, settings
 from app.models.property import PropertyInput
 from app.models.storyboard import StoryboardOutput
 from app.models.job import VideoJob, JobStatus, OutputMetadata
 from app.services.storyboard_service import StoryboardService
 from app.services.video_renderer import VideoRenderer
+from app.services.mongodb_service import mongodb_service
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class JobManager:
                 cls._instance._executor = ThreadPoolExecutor(max_workers=3)
         return cls._instance
 
-    def create_job(self, prop: PropertyInput) -> VideoJob:
+    def create_job(self, prop: PropertyInput, storyboard_preview: Optional[StoryboardOutput] = None) -> VideoJob:
         job_id = str(uuid.uuid4())
         job = VideoJob(
             job_id=job_id,
@@ -38,12 +39,33 @@ class JobManager:
             updated_at=datetime.now(timezone.utc)
         )
         self._jobs[job_id] = job
+        
+        # Persist to MongoDB if connected
+        try:
+            mongodb_service.save_job(job.model_dump())
+            mongodb_service.save_property(job_id, prop.model_dump())
+        except Exception as e:
+            logger.warning(f"Failed to record initial job {job_id} in MongoDB: {e}")
+
         # Submit to background thread pool
-        self._executor.submit(self._run_job, job_id, prop)
+        self._executor.submit(self._run_job, job_id, prop, storyboard_preview)
         return job
 
     def get_job(self, job_id: str) -> Optional[VideoJob]:
-        return self._jobs.get(job_id)
+        job = self._jobs.get(job_id)
+        if job:
+            return job
+        
+        # If not in memory, attempt to retrieve from MongoDB Atlas
+        doc = mongodb_service.get_job(job_id)
+        if doc:
+            try:
+                recovered = VideoJob(**doc)
+                self._jobs[job_id] = recovered
+                return recovered
+            except Exception as e:
+                logger.warning(f"Error restoring job {job_id} from MongoDB: {e}")
+        return None
 
     def _update_job(self, job_id: str, status: JobStatus, progress: int, stage: str, error: Optional[str] = None):
         job = self._jobs.get(job_id)
@@ -54,8 +76,13 @@ class JobManager:
             job.updated_at = datetime.now(timezone.utc)
             if error:
                 job.error_message = error
+            # Update MongoDB
+            try:
+                mongodb_service.save_job(job.model_dump())
+            except Exception:
+                pass
 
-    def _run_job(self, job_id: str, prop: PropertyInput):
+    def _run_job(self, job_id: str, prop: PropertyInput, storyboard_preview: Optional[StoryboardOutput] = None):
         logger.info(f"Starting execution for video job {job_id}")
         try:
             # Stage 1: Validation
@@ -63,7 +90,11 @@ class JobManager:
             
             # Stage 2: Scripting & Storyboard
             self._update_job(job_id, JobStatus.SCRIPTING, 20, "Generating factual real estate script and scenes")
-            storyboard = StoryboardService.generate_storyboard(prop)
+            storyboard = storyboard_preview or StoryboardService.generate_storyboard(prop)
+            try:
+                mongodb_service.save_storyboard(job_id, storyboard.model_dump())
+            except Exception:
+                pass
 
             # Stage 3: Preparing scenes
             self._update_job(job_id, JobStatus.PREPARING, 30, "Composing visual cards and preparing assets")
@@ -86,9 +117,29 @@ class JobManager:
             # Stage 5: Finalizing
             self._update_job(job_id, JobStatus.FINALIZING, 95, "Finalizing output and generating stream links")
 
+            # Persist MP4 to MongoDB GridFS if enabled
+            gridfs_video_id = None
+            if mongodb_service.is_connected() and settings.MONGODB_GRIDFS_ENABLED:
+                try:
+                    with open(output_mp4_path, "rb") as vf:
+                        video_bytes = vf.read()
+                    gridfs_video_id = mongodb_service.save_file_to_gridfs(
+                        file_bytes=video_bytes,
+                        filename=f"{video_id}.mp4",
+                        content_type="video/mp4",
+                        metadata={
+                            "video_id": video_id,
+                            "job_id": job_id,
+                            "duration": metadata_dict["duration_seconds"],
+                            "property_name": prop.property_name
+                        }
+                    )
+                except Exception as gfs_err:
+                    logger.warning(f"Could not upload video {video_id} to GridFS: {gfs_err}")
+
             job = self._jobs[job_id]
             job.video_id = video_id
-            job.video_url = f"/api/videos/{video_id}"
+            job.video_url = f"/api/videos/{video_id}/stream"
             job.download_url = f"/api/videos/{video_id}/download"
             job.metadata = OutputMetadata(
                 duration_seconds=metadata_dict["duration_seconds"],
@@ -99,6 +150,26 @@ class JobManager:
                 fps=metadata_dict["fps"],
                 aspect_ratio=metadata_dict["aspect_ratio"]
             )
+
+            # Persist completed video entry into MongoDB video library
+            try:
+                mongodb_service.save_video_record({
+                    "video_id": video_id,
+                    "job_id": job_id,
+                    "property_name": prop.property_name,
+                    "location": prop.location,
+                    "price_display": prop.price_display or f"{prop.currency}{prop.price:,.0f}",
+                    "file_size_bytes": metadata_dict["file_size_bytes"],
+                    "duration": metadata_dict["duration_seconds"],
+                    "aspect_ratio": metadata_dict["aspect_ratio"],
+                    "stream_url": f"/api/videos/{video_id}/stream",
+                    "download_url": f"/api/videos/{video_id}/download",
+                    "gridfs_video_id": gridfs_video_id,
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                })
+            except Exception as vid_err:
+                logger.warning(f"Failed to save video record for {video_id} to MongoDB: {vid_err}")
+
             self._update_job(job_id, JobStatus.COMPLETED, 100, "Video generation complete and ready to preview!")
             logger.info(f"Video job {job_id} successfully completed. Video ID: {video_id}")
 

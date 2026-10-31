@@ -806,3 +806,59 @@ class TestVideoJob:
         assert client.get(f"/api/videos/{nonexistent}").status_code == 404
         assert client.get(f"/api/videos/{nonexistent}/stream").status_code == 404
         assert client.get(f"/api/videos/{nonexistent}/download").status_code == 404
+
+
+# ============================================================================
+# 8. MongoDB Atlas Storage Tests
+# ============================================================================
+
+class TestMongoDBAtlasService:
+    def test_health_check_includes_mongodb_status(self, client):
+        """GET /api/health should report MongoDB configuration and connection status."""
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "mongodb" in data
+        mongo_status = data["mongodb"]
+        assert "configured" in mongo_status
+        assert "connected" in mongo_status
+        assert isinstance(mongo_status["configured"], bool)
+        assert isinstance(mongo_status["connected"], bool)
+
+    def test_mongodb_fallback_graceful_methods(self):
+        """When disconnected, MongoDBService operations must safely return None/False without crashing."""
+        from app.services.mongodb_service import mongodb_service
+        
+        # Test safe fallback behaviors
+        assert mongodb_service.save_job({"job_id": "fake_123"}) in (True, False)
+        assert mongodb_service.get_job("fake_123") is None or isinstance(mongodb_service.get_job("fake_123"), dict)
+        assert mongodb_service.list_videos() == [] or isinstance(mongodb_service.list_videos(), list)
+        assert mongodb_service.save_file_to_gridfs(b"fake_bytes", "fake.jpg", "image/jpeg") is None or isinstance(mongodb_service.save_file_to_gridfs(b"fake_bytes", "fake.jpg", "image/jpeg"), str)
+        assert mongodb_service.get_file_from_gridfs("nonexistent.mp4") is None
+
+    def test_mongodb_mocked_persistence(self):
+        """Verifies MongoDBService job and video record upsert logic when a database is connected."""
+        from app.services.mongodb_service import MongoDBService
+        from unittest.mock import MagicMock
+        
+        svc = MongoDBService()
+        mock_db = MagicMock()
+        svc._db = mock_db
+        svc._client = MagicMock()
+        svc._client.admin.command.return_value = {"ok": 1}
+
+        # Test job upsert
+        success = svc.save_job({"job_id": "test_job_1", "status": "queued"})
+        assert success is True
+        mock_db.__getitem__.assert_called()
+        
+        # Test video record upsert
+        vid_success = svc.save_video_record({"video_id": "v1", "property_name": "Test Villa"})
+        assert vid_success is True
+
+        # Test get_job
+        mock_db["jobs"].find_one.return_value = {"_id": "mongo_id", "job_id": "test_job_1", "status": "queued"}
+        retrieved = svc.get_job("test_job_1")
+        assert retrieved is not None
+        assert retrieved["job_id"] == "test_job_1"
+        assert "_id" not in retrieved

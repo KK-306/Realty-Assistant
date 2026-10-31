@@ -23,7 +23,9 @@ export default function VideoComplete({
   const [copied, setCopied] = useState(false);
 
   const videoId = videoJob?.video_id || videoJob?.job_id;
-  const streamUrl = videoJob?.video_url || `/api/videos/${videoId}/stream`;
+  // `video_url` may be a legacy metadata URL (`/api/videos/{id}`), so preview
+  // through the dedicated MP4 stream endpoint unless an explicit stream URL exists.
+  const streamUrl = videoJob?.stream_url || `/api/videos/${videoId}/stream`;
   const downloadUrl = videoJob?.download_url || `/api/videos/${videoId}/download`;
   const metadata = videoJob?.metadata;
 

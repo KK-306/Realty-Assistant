@@ -175,7 +175,7 @@ export default function MyVideosModal({ isOpen, onClose, onCreateNew, onLoadSamp
               </div>
               <div className="aspect-video bg-black rounded-lg overflow-hidden shadow-inner border border-slate-300">
                 <video
-                  src={activeVideo.stream_url || `/api/videos/${activeVideo.video_id}/stream`}
+                  src={`/api/videos/${encodeURIComponent(activeVideo.video_id)}/stream`}
                   controls
                   autoPlay
                   className="w-full h-full object-contain"

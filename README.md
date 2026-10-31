@@ -33,9 +33,9 @@
 
 ## Overview
 
-**RA Property Studio AI** is an enterprise-grade full-stack web application created by **Realty Assistant** (part of **Viraj Ventures**) that converts property information and 4–8 uploaded property images into a professional, ready-to-share promotional video in MP4 format — **without requiring the user to manually edit a video**.
+**RA Property Studio AI** is an enterprise-grade full-stack web application created by **Realty Assistant** (part of **Viraj Ventures**) that turns property information, a draft script, and up to 8 uploaded photos into a professional, ready-to-share promotional video in MP4 format — **without requiring the user to manually edit a video**.
 
-The application works **completely without paid API keys** out of the box using a deterministic template-based script generator and offline pyttsx3 / edge-tts narration. Optionally, you can configure Gemini, OpenAI, or Groq for LLM-powered script generation.
+The application works without API keys using a deterministic template-based script generator and Edge TTS narration. With Gemini configured, it can refine a supplied narration draft and generate illustrative concept images to fill any missing scenes. Gemini generated images are labeled as concepts because they do not show the exact property.
 
 ---
 
@@ -93,12 +93,12 @@ The application works **completely without paid API keys** out of the box using 
 ## Features
 
 - **Property Information Form**: Comprehensive form with validation for property name, location, price, type, features, bedrooms/bathrooms, contact info, and video settings
-- **Image Upload**: Support for 4–8 images (JPEG, PNG, WebP) with drag-to-reorder, preview, and server-side validation
-- **AI Script Generation**: Theme-aware promotional scripts using LLM or deterministic template fallback — strictly factual, never invents claims
+- **Image Upload**: Support for up to 8 images (JPEG, PNG, WebP) with drag-to-reorder, preview, and server-side validation; Gemini can generate missing scene concepts
+- **AI Script Generation**: Theme-aware promotional scripts using LLM or deterministic template fallback; Gemini can polish a user draft while keeping claims grounded in property details
 - **Storyboard Preview**: Visual scene-by-scene preview before rendering
 - **Ken Burns Effects**: Subtle zoom and pan animations on property images
 - **Text Overlays**: Theme-specific translucent info cards with typography, tags, and price badges
-- **Voiceover Narration**: Automatic text-to-speech using Edge TTS (configurable voice)
+- **Voiceover Narration**: Scene-specific narration is synthesized per image and timed to its scene duration using Edge TTS (configurable voice)
 - **Background Music**: Synthesized ambient soundtrack with volume ducking under narration
 - **Video Formats**: 16:9 landscape or 9:16 vertical (Instagram/TikTok ready)
 - **Duration Control**: 20, 30, or 40 second videos
@@ -166,10 +166,11 @@ npm install
 copy .env.example .env    # Windows
 # cp .env.example .env    # Linux/macOS
 
-# Edit .env if you want to configure LLM API keys (optional)
+# Set LLM_PROVIDER=gemini and add your Gemini API key for script refinement and image generation.
+# Add your MongoDB Atlas URI to enable GridFS and video library persistence.
 ```
 
-The application works fully **without any API keys** using the default template generator and Edge TTS.
+The application loads settings from the project-root `.env` file. Replace the blank `LLM_API_KEY` and `MONGODB_URI` entries with your credentials; `.env` is ignored by git. Without Gemini, upload at least four photos to create a video.
 
 ### 5. FFmpeg verification
 
@@ -339,7 +340,7 @@ User Input → Validation → Script Generation → Storyboard → Video Renderi
 
 ### Detailed Pipeline
 
-1. **Input Validation**: Pydantic model validates all fields, image count (4–8), price > 0, duration in [20, 30, 40]
+1. **Input Validation**: Pydantic model validates all fields, image count (up to 8; Gemini fills missing scenes when configured), price > 0, duration in [20, 30, 40]
 
 2. **Script Generation**: 
    - Tries configured LLM provider (Gemini/OpenAI/Groq) if API key is set
@@ -400,9 +401,37 @@ LLM Script → Template Script (if LLM fails)
 Edge TTS → Silent video (if TTS fails)
 Ken Burns → Simple scale (if FFmpeg zoompan fails)
 Background music → No music (if WAV not found)
+MongoDB Atlas (GridFS & Metadata) → Local storage & in-memory jobs (if unconfigured/offline)
 ```
 
-The application always produces a valid MP4, even with all external services unavailable.
+The application always produces a valid MP4 and maintains full functionality, even with all external services or databases unavailable.
+
+---
+
+## MongoDB Atlas Storage
+
+RA Property Studio AI includes enterprise storage support for **MongoDB Atlas** with **GridFS**:
+
+- **Collections**:
+  - `jobs`: Stores video generation jobs, progress percentages, and current stage messages.
+  - `videos`: Catalogs completed video records with duration, resolution, property details, and download links.
+  - `properties`: Persists submitted property inputs and parameters.
+  - `storyboards`: Archives generated scene sequences and overlay text.
+- **GridFS Binary Storage**:
+  - Automatically stores uploaded property photos and rendered MP4 promotional videos directly in Atlas GridFS when configured.
+  - Supports chunked storage, making it suitable for high-definition video files.
+  - Built-in caching: assets stored in GridFS are transparently streamed or downloaded to local disk as needed.
+- **Graceful Fallback**:
+  - If `MONGODB_URI` is not set or network is unreachable, the system automatically falls back to local disk storage (`storage/uploads`, `storage/outputs`) and in-memory job dictionaries.
+
+To enable MongoDB Atlas, add your connection string to `.env`:
+```env
+MONGODB_URI=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/?retryWrites=true&w=majority
+MONGODB_DB_NAME=ra_property_studio
+MONGODB_GRIDFS_ENABLED=true
+```
+
+Connection health is reported live on `GET /api/health`.
 
 ---
 
@@ -414,11 +443,15 @@ All configuration is via environment variables (`.env` file):
 |----------|---------|-------------|
 | `LLM_PROVIDER` | `template` | Script generation provider: template, gemini, openai, groq |
 | `LLM_API_KEY` | (empty) | API key for LLM provider |
-| `LLM_MODEL` | `gemini-1.5-flash` | Model name for LLM provider |
+| `LLM_MODEL` | `gemini-3.8-flash` | Text model for script refinement |
+| `GEMINI_IMAGE_MODEL` | `gemini-3.1-flash-image` | Gemini image model for missing scene concepts |
 | `TTS_PROVIDER` | `edge_tts` | TTS provider: edge_tts, none |
 | `TTS_VOICE_EN` | `en-US-ChristopherNeural` | English TTS voice |
 | `TTS_VOICE_IN` | `en-IN-PrabhatNeural` | Indian English TTS voice |
 | `FFMPEG_PATH` | (auto-detect) | Custom FFmpeg binary path |
+| `MONGODB_URI` | (empty) | MongoDB Atlas connection string (`mongodb+srv://...`) |
+| `MONGODB_DB_NAME` | `ra_property_studio` | MongoDB database name |
+| `MONGODB_GRIDFS_ENABLED` | `true` | Enable GridFS binary storage for images & MP4s |
 | `HOST` | `0.0.0.0` | Server bind host |
 | `PORT` | `8000` | Server bind port |
 

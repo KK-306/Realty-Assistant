@@ -13,7 +13,9 @@ import {
   Layers,
   CheckCircle2,
   Monitor,
-  Palette
+  Palette,
+  Pencil,
+  Check
 } from 'lucide-react';
 
 export default function StoryboardPreview({
@@ -23,8 +25,10 @@ export default function StoryboardPreview({
   onGenerateVideo,
   onBackToEdit,
   isGenerating,
+  onStoryboardChange,
 }) {
   const [showFullScript, setShowFullScript] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
 
   if (!storyboard || !storyboard.scenes) {
     return (
@@ -41,6 +45,69 @@ export default function StoryboardPreview({
   }
 
   const { script, scenes, total_duration, aspect_ratio, theme } = storyboard;
+
+  const updateStoryboard = (update) => {
+    if (!onStoryboardChange) return;
+
+    onStoryboardChange((current) => {
+      if (!current) return current;
+
+      const next = update(current);
+      const sceneVoiceovers = next.scenes.map((scene) => scene.voiceover_text || '');
+      return {
+        ...next,
+        script: {
+          ...next.script,
+          scene_voiceovers: sceneVoiceovers,
+          voiceover_full: sceneVoiceovers.filter(Boolean).join(' '),
+        },
+      };
+    });
+  };
+
+  const updateScript = (field, value) => {
+    updateStoryboard((current) => ({
+      ...current,
+      script: { ...current.script, [field]: value },
+      // The opening hook and closing CTA are spoken in the first and last scenes.
+      scenes: current.scenes.map((scene, index) => {
+        if (field === 'opening_hook' && index === 0) {
+          return { ...scene, voiceover_text: value };
+        }
+        if (field === 'closing_cta' && index === current.scenes.length - 1) {
+          return { ...scene, voiceover_text: value };
+        }
+        return scene;
+      }),
+    }));
+  };
+
+  const updateScene = (sceneIndex, field, value) => {
+    updateStoryboard((current) => {
+      const scenes = current.scenes.map((scene, index) => {
+        if (index !== sceneIndex) return scene;
+        if (field.startsWith('overlay.')) {
+          const overlayField = field.slice('overlay.'.length);
+          return {
+            ...scene,
+            overlay: { ...scene.overlay, [overlayField]: value },
+          };
+        }
+        return { ...scene, [field]: value };
+      });
+
+      return {
+        ...current,
+        scenes,
+        ...(field === 'voiceover_text' && sceneIndex === scenes.length - 1
+          ? { script: { ...current.script, closing_cta: value } }
+          : {}),
+      };
+    });
+  };
+
+  const inputClassName = 'w-full rounded-lg border border-[#D9D9E6] bg-white px-3 py-2 text-sm text-[#292943] outline-none focus:border-[#344E8B] focus:ring-2 focus:ring-[#344E8B]/10';
+  const textareaClassName = `${inputClassName} resize-y`;
 
   // Scene Type badge styling helper
   const getSceneTypeBadge = (type) => {
@@ -98,6 +165,14 @@ export default function StoryboardPreview({
           <span className="text-xs uppercase font-bold tracking-wider text-[#344E8B]">Step 2 of 3</span>
           <span className="text-slate-300">•</span>
           <span className="text-xs font-semibold text-[#686A7D]">Storyboard Approval</span>
+          <button
+            type="button"
+            onClick={() => setIsEditing((editing) => !editing)}
+            className="ml-2 inline-flex items-center gap-1.5 rounded-lg border border-[#344E8B]/30 bg-white px-3 py-2 text-xs font-semibold text-[#344E8B] transition-colors hover:bg-[#344E8B]/5"
+          >
+            {isEditing ? <Check className="h-3.5 w-3.5" /> : <Pencil className="h-3.5 w-3.5" />}
+            {isEditing ? 'Done editing' : 'Edit storyboard'}
+          </button>
         </div>
       </div>
 
@@ -124,17 +199,35 @@ export default function StoryboardPreview({
               </span>
             </div>
 
-            <h1 className="text-2xl sm:text-3xl lg:text-4xl font-extrabold font-outfit text-[#292943] leading-tight">
-              {script?.video_title || formData?.property_name || 'Cinematic Property Showcase'}
-            </h1>
+            {isEditing ? (
+              <label className="block">
+                <span className="mb-1 block text-xs font-semibold text-[#686A7D]">Video title</span>
+                <input
+                  value={script?.video_title || ''}
+                  onChange={(event) => updateScript('video_title', event.target.value)}
+                  className={`${inputClassName} text-xl font-bold sm:text-2xl`}
+                />
+              </label>
+            ) : (
+              <h1 className="text-2xl sm:text-3xl lg:text-4xl font-extrabold font-outfit text-[#292943] leading-tight">
+                {script?.video_title || formData?.property_name || 'Cinematic Property Showcase'}
+              </h1>
+            )}
 
             {/* Opening Hook Banner */}
-            {script?.opening_hook && (
+            {(script?.opening_hook || isEditing) && (
               <div className="mt-4 p-4 rounded-xl bg-gradient-to-r from-[#344E8B]/5 to-[#A93478]/5 border border-[#344E8B]/20 text-[#292943] text-sm leading-relaxed">
                 <span className="font-bold text-[#344E8B] uppercase text-xs tracking-wider block mb-1">
-                  Opening Hook:
+                  Opening Hook {isEditing ? '(spoken narration)' : ''}:
                 </span>
-                "{script.opening_hook}"
+                {isEditing ? (
+                  <textarea
+                    rows={3}
+                    value={script?.opening_hook || ''}
+                    onChange={(event) => updateScript('opening_hook', event.target.value)}
+                    className={textareaClassName}
+                  />
+                ) : `"${script.opening_hook}"`}
               </div>
             )}
           </div>
@@ -197,9 +290,21 @@ export default function StoryboardPreview({
               <p className="italic bg-white p-4 rounded-xl border border-[#E5E5EF]">
                 "{script.voiceover_full}"
               </p>
-              {script.closing_cta && (
+              {(script.closing_cta || isEditing) && (
                 <div className="text-xs text-[#A93478] font-bold">
-                  <strong>Closing Call:</strong> {script.closing_cta}
+                  {isEditing ? (
+                    <label className="block">
+                      <span className="mb-1 block">Closing Call (updates the final scene narration)</span>
+                      <textarea
+                        rows={2}
+                        value={script.closing_cta}
+                        onChange={(event) => updateScript('closing_cta', event.target.value)}
+                        className={textareaClassName}
+                      />
+                    </label>
+                  ) : (
+                    <><strong>Closing Call:</strong> {script.closing_cta}</>
+                  )}
                 </div>
               )}
             </div>
@@ -248,6 +353,12 @@ export default function StoryboardPreview({
                         Scene #{idx + 1}
                       </div>
 
+                      {scene.generated_image && (
+                        <div className="absolute top-2 right-2 bg-[#A93478]/90 px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wide text-white shadow-sm">
+                          AI concept image
+                        </div>
+                      )}
+
                       {/* Duration Tag */}
                       <div className="absolute bottom-2 right-2 bg-black/75 backdrop-blur-md px-2 py-0.5 rounded text-[11px] font-semibold text-white flex items-center gap-1">
                         <Clock className="w-3 h-3 text-white" />
@@ -283,6 +394,17 @@ export default function StoryboardPreview({
                       </span>
                     </div>
 
+                    {isEditing && (
+                      <label className="block">
+                        <span className="mb-1 block text-xs font-semibold text-[#686A7D]">Scene caption</span>
+                        <input
+                          value={scene.caption || ''}
+                          onChange={(event) => updateScene(idx, 'caption', event.target.value)}
+                          className={inputClassName}
+                        />
+                      </label>
+                    )}
+
                     {/* Graphic Overlays Box */}
                     <div className="p-4 rounded-xl bg-[#F7F7FC] border border-[#E5E5EF]">
                       <div className="text-[11px] uppercase tracking-wider text-[#344E8B] font-bold mb-2 flex items-center gap-1.5">
@@ -290,44 +412,84 @@ export default function StoryboardPreview({
                         <span>On-Screen Graphic Overlay</span>
                       </div>
 
-                      {scene.overlay?.tag && (
-                        <div className="text-[10px] uppercase font-bold text-[#A93478] tracking-wider mb-1">
-                          [{scene.overlay.tag}]
+                      {isEditing ? (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          {[
+                            ['tag', 'Tag'],
+                            ['title', 'Title'],
+                            ['subtitle', 'Subtitle'],
+                            ['badge', 'Badge'],
+                            ['footer', 'Footer'],
+                          ].map(([field, label]) => (
+                            <label key={field} className={field === 'subtitle' || field === 'footer' ? 'sm:col-span-2' : ''}>
+                              <span className="mb-1 block text-[11px] font-semibold text-[#686A7D]">{label}</span>
+                              <input
+                                value={scene.overlay?.[field] || ''}
+                                onChange={(event) => updateScene(idx, `overlay.${field}`, event.target.value)}
+                                className={inputClassName}
+                              />
+                            </label>
+                          ))}
                         </div>
+                      ) : (
+                        <>
+                          {scene.overlay?.tag && (
+                            <div className="text-[10px] uppercase font-bold text-[#A93478] tracking-wider mb-1">
+                              [{scene.overlay.tag}]
+                            </div>
+                          )}
+
+                          <h4 className="text-base sm:text-lg font-bold font-outfit text-[#292943]">
+                            {scene.overlay?.title || scene.caption}
+                          </h4>
+
+                          {scene.overlay?.subtitle && (
+                            <p className="text-xs text-[#686A7D] mt-1">
+                              {scene.overlay.subtitle}
+                            </p>
+                          )}
+
+                          <div className="flex flex-wrap gap-3 mt-3 pt-2 border-t border-[#E5E5EF] text-xs">
+                            {scene.overlay?.badge && (
+                              <span className="px-2 py-0.5 rounded bg-[#344E8B]/10 text-[#344E8B] font-semibold">
+                                Badge: {scene.overlay.badge}
+                              </span>
+                            )}
+                            {scene.overlay?.footer && (
+                              <span className="text-[#686A7D] italic">
+                                Footer: {scene.overlay.footer}
+                              </span>
+                            )}
+                          </div>
+                        </>
                       )}
-
-                      <h4 className="text-base sm:text-lg font-bold font-outfit text-[#292943]">
-                        {scene.overlay?.title || scene.caption}
-                      </h4>
-
-                      {scene.overlay?.subtitle && (
-                        <p className="text-xs text-[#686A7D] mt-1">
-                          {scene.overlay.subtitle}
-                        </p>
-                      )}
-
-                      <div className="flex flex-wrap gap-3 mt-3 pt-2 border-t border-[#E5E5EF] text-xs">
-                        {scene.overlay?.badge && (
-                          <span className="px-2 py-0.5 rounded bg-[#344E8B]/10 text-[#344E8B] font-semibold">
-                            Badge: {scene.overlay.badge}
-                          </span>
-                        )}
-                        {scene.overlay?.footer && (
-                          <span className="text-[#686A7D] italic">
-                            Footer: {scene.overlay.footer}
-                          </span>
-                        )}
-                      </div>
                     </div>
 
                     {/* Voiceover text */}
-                    {scene.voiceover_text && (
+                    {(scene.voiceover_text || isEditing) && (
                       <div className="flex items-start gap-2.5 text-xs sm:text-sm text-[#292943] bg-white p-3.5 rounded-xl border border-[#E5E5EF]">
                         <Volume2 className="w-4 h-4 text-[#A93478] shrink-0 mt-0.5" />
-                        <div>
-                          <strong className="text-[#344E8B]">Narration:</strong>{' '}
-                          <span className="text-[#292943]">"{scene.voiceover_text}"</span>
-                        </div>
+                        {isEditing && idx > 0 ? (
+                          <label className="flex-1">
+                            <span className="mb-1 block font-bold text-[#344E8B]">Scene narration</span>
+                            <textarea
+                              rows={3}
+                              value={scene.voiceover_text || ''}
+                              onChange={(event) => updateScene(idx, 'voiceover_text', event.target.value)}
+                              className={textareaClassName}
+                            />
+                          </label>
+                        ) : isEditing ? (
+                          <div>
+                            <strong className="text-[#344E8B]">Scene narration:</strong>{' '}
+                            <span>The opening scene narration is linked to the opening hook above.</span>
+                          </div>
+                        ) : (
+                          <div>
+                            <strong className="text-[#344E8B]">Narration:</strong>{' '}
+                            <span className="text-[#292943]">"{scene.voiceover_text}"</span>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>

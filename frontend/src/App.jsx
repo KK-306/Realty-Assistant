@@ -27,6 +27,7 @@ export default function App() {
     bedrooms: '2',
     bathrooms: '2',
     description: '',
+    script_text: '',
     contact_name: 'Sales Team',
     contact_details: '',
     cta_text: 'Schedule a Visit',
@@ -149,7 +150,7 @@ export default function App() {
       const res = await fetch('/api/videos/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ ...payload, storyboard_preview: storyboard }),
       });
 
       if (!res.ok) {
@@ -183,7 +184,7 @@ export default function App() {
         location: formData.location || 'Prime Real Estate',
         duration: completedJob.metadata?.duration_seconds || formData.duration || 30,
         aspect_ratio: completedJob.metadata?.aspect_ratio || formData.aspect_ratio || '16:9',
-        stream_url: completedJob.video_url || `/api/videos/${completedJob.video_id}/stream`,
+        stream_url: `/api/videos/${completedJob.video_id || completedJob.job_id}/stream`,
         download_url: completedJob.download_url || `/api/videos/${completedJob.video_id}/download`,
         date: new Date().toISOString(),
       };
@@ -391,6 +392,7 @@ export default function App() {
             formData={formData}
             uploadedImages={uploadedImages}
             onGenerateVideo={handleGenerateVideo}
+            onStoryboardChange={setStoryboard}
             onBackToEdit={() => {
               setStep(1);
               window.scrollTo({ top: 0, behavior: 'smooth' });

@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from app.models.property import PropertyInput, ValidationResponse
+from app.config import settings
 
 router = APIRouter(prefix="/api/properties", tags=["Properties"])
 
@@ -11,10 +12,12 @@ def validate_property_details(prop: PropertyInput):
     errors = []
     
     # Check image count constraints
-    if len(prop.image_ids) < 4:
-        errors.append("At least 4 property images must be uploaded (4 to 8 required).")
-    elif len(prop.image_ids) > 8:
+    if len(prop.image_ids) > 8:
         errors.append("A maximum of 8 property images is allowed.")
+    elif len(prop.image_ids) < 4 and not (
+        settings.LLM_PROVIDER == "gemini" and settings.LLM_API_KEY
+    ):
+        errors.append("Upload at least 4 photos, or configure Gemini to generate the missing images.")
         
     if prop.price <= 0:
         errors.append("Price must be a positive numeric value.")

@@ -42,6 +42,7 @@ export default function PropertyForm({
     bedrooms: initialData?.bedrooms !== undefined && initialData?.bedrooms !== null ? String(initialData.bedrooms) : '2',
     bathrooms: initialData?.bathrooms !== undefined && initialData?.bathrooms !== null ? String(initialData.bathrooms) : '2',
     description: initialData?.description || '',
+    script_text: initialData?.script_text || '',
     contact_name: initialData?.contact_name || 'Sales Team',
     contact_details: initialData?.contact_details || '',
     cta_text: initialData?.cta_text || 'Schedule a Visit',
@@ -322,9 +323,7 @@ export default function PropertyForm({
 
     // Image validations
     const validImages = images.filter((img) => img.status === 'success' || !img.temp);
-    if (validImages.length < 4) {
-      newErrors.images = `At least 4 images are required (currently ${validImages.length}).`;
-    } else if (validImages.length > 8) {
+    if (validImages.length > 8) {
       newErrors.images = `A maximum of 8 images is allowed (currently ${validImages.length}).`;
     }
 
@@ -367,6 +366,7 @@ export default function PropertyForm({
         bedrooms: isResidential && formData.bedrooms !== '' ? parseInt(formData.bedrooms, 10) : undefined,
         bathrooms: isResidential && formData.bathrooms !== '' ? parseInt(formData.bathrooms, 10) : undefined,
         description: formData.description.trim() || undefined,
+        script_text: formData.script_text.trim() || undefined,
         contact_name: formData.contact_name.trim() || 'Sales Team',
         contact_details: formData.contact_details.trim() || undefined,
         cta_text: formData.cta_text.trim() || 'Schedule a Visit',
@@ -411,8 +411,24 @@ export default function PropertyForm({
 
       const storyboard = await storyRes.json();
 
+      const generatedImages = storyboard.scenes
+        .filter((scene) => scene.generated_image)
+        .map((scene, index) => ({
+          image_id: scene.image_id,
+          filename: `${scene.image_id}.png`,
+          original_filename: `Gemini concept image ${index + 1}`,
+          preview_url: `/api/images/${scene.image_id}/preview`,
+          status: 'success',
+          generated: true,
+        }));
+      const storyboardImageIds = storyboard.scenes.map((scene) => scene.image_id);
+
       // Pass ready data up
-      onStoryboardReady(storyboard, payload, validImages);
+      onStoryboardReady(
+        storyboard,
+        { ...payload, image_ids: storyboardImageIds },
+        [...validImages, ...generatedImages]
+      );
     } catch (err) {
       setApiError(err.message || 'An error occurred during submission.');
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -687,6 +703,23 @@ export default function PropertyForm({
             />
           </div>
 
+          {/* Optional user draft for Gemini to improve */}
+          <div className="mt-6">
+            <label className="block text-xs font-bold uppercase tracking-wider text-[#292943] mb-2 flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5 text-[#A93478]" />
+              <span>Draft Narration (Optional)</span>
+            </label>
+            <textarea
+              name="script_text"
+              rows={4}
+              value={formData.script_text}
+              onChange={handleInputChange}
+              maxLength={5000}
+              placeholder="Paste your draft here. Gemini will polish its flow and delivery while keeping claims grounded in the property details above."
+              className="w-full px-4 py-3 rounded-xl bg-[#F7F7FC] border border-[#E5E5EF] text-[#292943] placeholder-[#A3A7BE] text-sm focus:border-[#344E8B] focus:outline-none resize-y transition-colors"
+            />
+          </div>
+
           {/* Key Features Chips Input */}
           <div className="mt-6">
             <div className="flex items-center justify-between mb-2">
@@ -763,7 +796,7 @@ export default function PropertyForm({
               </div>
               <div>
                 <h3 className="text-lg font-bold font-outfit text-[#292943]">Property Visuals</h3>
-                <p className="text-xs text-[#686A7D]">Drag to reorder scenes. 4 to 8 images required.</p>
+                <p className="text-xs text-[#686A7D]">Upload up to 8 photos. Gemini can create concept visuals for missing scenes.</p>
               </div>
             </div>
 
@@ -775,7 +808,7 @@ export default function PropertyForm({
                     : 'border-[#A93478]/40 bg-[#A93478]/10 text-[#A93478]'
                 }`}
               >
-                {images.length} / 8 photos ({images.length < 4 ? `Need ${4 - images.length} more` : 'Count valid'})
+                {images.length} / 8 photos ({images.length < 4 ? `Gemini can create ${4 - images.length} concept image${4 - images.length === 1 ? '' : 's'}` : 'Ready'})
               </span>
             </div>
           </div>
@@ -849,6 +882,7 @@ export default function PropertyForm({
                     <div className="absolute top-2 left-2 z-10 flex items-center gap-1 bg-white/90 backdrop-blur-md px-2 py-0.5 rounded text-[11px] font-bold text-[#344E8B] border border-[#E5E5EF] shadow-sm">
                       <span>#{index + 1}</span>
                       {index === 0 && <span className="text-[9px] uppercase tracking-wider text-[#A93478]">Cover</span>}
+                      {img.generated && <span className="text-[9px] uppercase tracking-wider text-[#A93478]">AI Concept</span>}
                     </div>
 
                     {/* Drag Handle */}
@@ -1265,7 +1299,7 @@ export default function PropertyForm({
             {isSubmitting ? (
               <>
                 <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                <span>Generating Storyboard...</span>
+                <span>Creating Script & Scene Images...</span>
               </>
             ) : (
               <>

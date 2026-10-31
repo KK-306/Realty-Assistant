@@ -40,7 +40,8 @@ class PropertyInput(BaseModel):
     voice_accent: Optional[str] = Field("en-US-BrianNeural", description="AI voice accent and tone")
     narration_enabled: bool = Field(True, description="Enable voiceover narration")
     music_enabled: bool = Field(True, description="Enable ambient background music")
-    image_ids: List[str] = Field(..., min_length=4, max_length=8, description="Ordered list of 4-8 uploaded image IDs")
+    script_text: Optional[str] = Field(None, max_length=5000, description="Optional draft narration for Gemini to refine")
+    image_ids: List[str] = Field(default_factory=list, max_length=8, description="Ordered list of up to 8 uploaded image IDs; Gemini can generate missing scenes")
 
     @field_validator("property_name", "location")
     @classmethod

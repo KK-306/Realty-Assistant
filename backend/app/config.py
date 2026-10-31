@@ -14,6 +14,15 @@ ASSETS_DIR = APP_DIR / "assets"
 SAMPLE_DIR = ASSETS_DIR / "sample_properties"
 AUDIO_DIR = ASSETS_DIR / "audio"
 
+# Load project-local secrets before settings are read. Environment variables set by
+# the host still take precedence over values in the .env file.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(WORKSPACE_DIR / ".env", override=False)
+except ImportError:
+    # Deployments can provide configuration through the process environment.
+    pass
+
 # Ensure directories exist
 for p in [UPLOAD_DIR, OUTPUT_DIR, SAMPLE_DIR, AUDIO_DIR]:
     p.mkdir(parents=True, exist_ok=True)
@@ -58,13 +67,19 @@ class Settings:
     # LLM Configuration
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "template").lower()  # "gemini", "openai", "groq", "template"
     LLM_API_KEY: Optional[str] = os.getenv("LLM_API_KEY")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-1.5-flash")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-3.8-flash")
+    GEMINI_IMAGE_MODEL: str = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image")
     
     # TTS Configuration
     TTS_PROVIDER: str = os.getenv("TTS_PROVIDER", "edge_tts").lower()  # "edge_tts", "none"
     TTS_VOICE_EN: str = os.getenv("TTS_VOICE_EN", "en-US-BrianNeural")
     TTS_VOICE_IN: str = os.getenv("TTS_VOICE_IN", "en-IN-PrabhatNeural")
     
+    # MongoDB Atlas Configuration
+    MONGODB_URI: Optional[str] = os.getenv("MONGODB_URI")
+    MONGODB_DB_NAME: str = os.getenv("MONGODB_DB_NAME", "ra_property_studio")
+    MONGODB_GRIDFS_ENABLED: bool = os.getenv("MONGODB_GRIDFS_ENABLED", "true").lower() in ("true", "1", "yes")
+
     # FFmpeg executable resolution
     @classmethod
     def get_ffmpeg_path(cls) -> str:

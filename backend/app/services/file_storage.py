@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, Tuple
 from PIL import Image
 
 from app.config import settings, UPLOAD_DIR, OUTPUT_DIR, SAMPLE_DIR
+from app.services.mongodb_service import mongodb_service
 
 class FileStorageService:
     @staticmethod
@@ -59,6 +60,21 @@ class FileStorageService:
         with open(destination_path, "wb") as f:
             f.write(file_bytes)
 
+        # Also persist to MongoDB GridFS if connected
+        gridfs_id = None
+        if mongodb_service.is_connected() and settings.MONGODB_GRIDFS_ENABLED:
+            gridfs_id = mongodb_service.save_file_to_gridfs(
+                file_bytes=file_bytes,
+                filename=safe_filename,
+                content_type=content_type,
+                metadata={
+                    "image_id": image_id,
+                    "original_filename": original_filename,
+                    "width": width,
+                    "height": height
+                }
+            )
+
         return {
             "image_id": image_id,
             "filename": safe_filename,
@@ -66,16 +82,18 @@ class FileStorageService:
             "width": width,
             "height": height,
             "size_bytes": len(file_bytes),
-            "preview_url": f"/api/images/{image_id}/preview"
+            "preview_url": f"/api/images/{image_id}/preview",
+            "gridfs_id": gridfs_id
         }
 
     @classmethod
     def get_image_path(cls, image_id: str) -> Optional[Path]:
         """
         Returns the absolute Path of an image by image_id, preventing directory traversal.
+        If file is missing locally but stored in MongoDB GridFS, it recovers/caches it locally.
         """
         safe_id = Path(image_id).name
-        # Check standard upload extensions
+        # Check standard upload extensions on local disk
         for ext in [".jpg", ".jpeg", ".png", ".webp"]:
             candidate = UPLOAD_DIR / f"{safe_id}{ext}"
             if candidate.is_file():
@@ -85,6 +103,18 @@ class FileStorageService:
         sample_file = SAMPLE_DIR / safe_id
         if sample_file.is_file():
             return sample_file
+
+        # Check if stored in MongoDB GridFS
+        if mongodb_service.is_connected() and settings.MONGODB_GRIDFS_ENABLED:
+            for ext in [".jpg", ".jpeg", ".png", ".webp", ""]:
+                test_filename = f"{safe_id}{ext}" if not safe_id.endswith(ext) else safe_id
+                data = mongodb_service.get_file_from_gridfs(test_filename)
+                if data:
+                    ext_to_use = ext or ".jpg"
+                    recovered_path = UPLOAD_DIR / f"{safe_id}{ext_to_use}"
+                    with open(recovered_path, "wb") as f:
+                        f.write(data)
+                    return recovered_path
             
         return None
 
@@ -118,4 +148,14 @@ class FileStorageService:
         candidate = OUTPUT_DIR / f"{safe_id}.mp4"
         if candidate.is_file():
             return candidate
+
+        # Check if stored in MongoDB GridFS
+        if mongodb_service.is_connected() and settings.MONGODB_GRIDFS_ENABLED:
+            video_filename = f"{safe_id}.mp4"
+            data = mongodb_service.get_file_from_gridfs(video_filename)
+            if data:
+                with open(candidate, "wb") as f:
+                    f.write(data)
+                return candidate
+
         return None

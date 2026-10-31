@@ -2,6 +2,7 @@ import shutil
 import subprocess
 from fastapi import APIRouter
 from app.config import settings
+from app.services.mongodb_service import mongodb_service
 
 router = APIRouter(prefix="/api/health", tags=["Health"])
 
@@ -36,5 +37,6 @@ def health_check():
         "storage": {
             "uploads_dir": str(settings.UPLOAD_DIR),
             "outputs_dir": str(settings.OUTPUT_DIR)
-        }
+        },
+        "mongodb": mongodb_service.get_status()
     }

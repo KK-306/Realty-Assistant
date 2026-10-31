@@ -1,27 +1,39 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from app.models.property import PropertyInput
+from app.models.storyboard import StoryboardOutput
 from app.models.job import VideoJob
 from app.services.job_manager import job_manager
 from app.services.file_storage import FileStorageService
+from app.services.mongodb_service import mongodb_service
 
 router = APIRouter(prefix="/api/videos", tags=["Videos"])
 
+
+class VideoGenerationRequest(PropertyInput):
+    storyboard_preview: StoryboardOutput | None = None
+
 @router.post("/generate")
-def create_video_render_job(prop: PropertyInput):
+def create_video_render_job(request: VideoGenerationRequest):
     """
     Submits a video generation task to the background queue and returns the tracking job_id.
     """
     # Validation checks
+    prop = PropertyInput(**request.model_dump(exclude={"storyboard_preview"}))
+    storyboard_preview = request.storyboard_preview
+
     if len(prop.image_ids) < 4 or len(prop.image_ids) > 8:
         raise HTTPException(status_code=400, detail="Between 4 and 8 property images are required.")
+
+    if storyboard_preview and [scene.image_id for scene in storyboard_preview.scenes] != prop.image_ids:
+        raise HTTPException(status_code=400, detail="Storyboard images do not match the submitted property images.")
 
     for img_id in prop.image_ids:
         path = FileStorageService.get_image_path(img_id)
         if not path or not path.is_file():
             raise HTTPException(status_code=400, detail=f"Image {img_id} was not found on server.")
 
-    job = job_manager.create_job(prop)
+    job = job_manager.create_job(prop, storyboard_preview=storyboard_preview)
     return {
         "job_id": job.job_id,
         "status": job.status.value,
@@ -43,11 +55,20 @@ def get_job_status(job_id: str):
 @router.get("/")
 def list_rendered_videos():
     """
-    Returns a list of all rendered promotional videos stored on the server.
+    Returns a list of all rendered promotional videos stored on MongoDB Atlas / server.
     """
     from app.config import OUTPUT_DIR
     import datetime
     
+    # Check MongoDB collection first
+    mongo_videos = []
+    if mongodb_service.is_connected():
+        mongo_videos = mongodb_service.list_videos()
+
+    if mongo_videos:
+        return {"videos": mongo_videos, "count": len(mongo_videos)}
+
+    # Fallback to scanning local output directory
     videos = []
     if OUTPUT_DIR.is_dir():
         files = sorted(OUTPUT_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -73,6 +94,12 @@ def get_video_metadata(video_id: str):
     """
     Returns metadata for a rendered video.
     """
+    # Check MongoDB for enriched record
+    if mongodb_service.is_connected():
+        doc = mongodb_service.get_video_record(video_id)
+        if doc:
+            return doc
+
     video_path = FileStorageService.get_video_path(video_id)
     if not video_path or not video_path.is_file():
         raise HTTPException(status_code=404, detail="Video file not found.")
