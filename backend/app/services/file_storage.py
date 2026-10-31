@@ -150,7 +150,7 @@ class FileStorageService:
                     "width": w,
                     "height": h,
                     "size_bytes": sf.stat().st_size,
-                    "preview_url": f"/api/samples/images/{sf.name}"
+                    "preview_url": f"/sample-properties/{sf.name}"
                 })
             except Exception:
                 continue

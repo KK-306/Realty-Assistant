@@ -87,7 +87,7 @@ export default function VideoComplete({
                 autoPlay
                 playsInline
                 className="w-full h-full object-contain bg-black"
-                poster="/api/samples/images/2_living_room.jpg"
+                poster="/sample-properties/2_living_room.jpg"
               >
                 Your browser does not support HTML5 video playback.
               </video>

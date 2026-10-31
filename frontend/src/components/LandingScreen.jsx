@@ -292,13 +292,13 @@ export default function LandingScreen({
                       playsInline
                       loop
                       className="w-full h-full object-cover"
-                      poster="/api/samples/images/1_exterior_facade.jpg"
+                      poster="/sample-properties/1_exterior_facade.jpg"
                       onPlay={() => setIsPlayingDemo(true)}
                       onPause={() => setIsPlayingDemo(false)}
                     />
                   ) : (
                     <img
-                      src="/api/samples/images/1_exterior_facade.jpg"
+                      src="/sample-properties/1_exterior_facade.jpg"
                       alt="Greenview Residency Luxury Facade"
                       className="w-full h-full object-cover transform group-hover:scale-105 transition-transform duration-700"
                     />
@@ -571,7 +571,7 @@ export default function LandingScreen({
               {sampleThumbnails.map((thumb, idx) => (
                 <div key={idx} className="group relative rounded-xl overflow-hidden bg-slate-200 aspect-square border border-[#E5E5EF]">
                   <img
-                    src={`/api/samples/images/${thumb.name}`}
+                    src={`/sample-properties/${thumb.name}`}
                     alt={thumb.label}
                     className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
                   />

@@ -106,7 +106,9 @@ export default function App() {
           filename: img.filename,
           original_filename: img.original_filename || img.filename,
           size_bytes: img.size_bytes || 250000,
-          preview_url: img.preview_url || `/api/samples/images/${img.filename}`,
+          // Serve demo previews from the frontend's static assets so they work
+          // even when Render routes API and frontend traffic through different services.
+          preview_url: `/sample-properties/${encodeURIComponent(img.filename || img.image_id)}`,
           status: 'success',
         }));
         setUploadedImages(mapped);
