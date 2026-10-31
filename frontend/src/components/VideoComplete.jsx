@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { apiUrl } from '../lib/api';
 import {
   Download,
   RefreshCw,
@@ -25,8 +26,8 @@ export default function VideoComplete({
   const videoId = videoJob?.video_id || videoJob?.job_id;
   // `video_url` may be a legacy metadata URL (`/api/videos/{id}`), so preview
   // through the dedicated MP4 stream endpoint unless an explicit stream URL exists.
-  const streamUrl = videoJob?.stream_url || `/api/videos/${videoId}/stream`;
-  const downloadUrl = videoJob?.download_url || `/api/videos/${videoId}/download`;
+  const streamUrl = apiUrl(videoJob?.stream_url || `/api/videos/${videoId}/stream`);
+  const downloadUrl = apiUrl(videoJob?.download_url || `/api/videos/${videoId}/download`);
   const metadata = videoJob?.metadata;
 
   const formatFileSize = (bytes) => {
@@ -39,7 +40,7 @@ export default function VideoComplete({
   };
 
   const handleShare = async () => {
-    const fullDownloadUrl = `${window.location.origin}${downloadUrl}`;
+    const fullDownloadUrl = new URL(downloadUrl, window.location.origin).toString();
     if (navigator.clipboard) {
       await navigator.clipboard.writeText(fullDownloadUrl);
       setCopied(true);

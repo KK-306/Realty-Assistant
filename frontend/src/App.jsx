@@ -7,6 +7,7 @@ import VideoGenerating from './components/VideoGenerating';
 import VideoComplete from './components/VideoComplete';
 import MyVideosModal from './components/MyVideosModal';
 import { Video, Home, RotateCcw, Film, Sparkles, Layers, ArrowRight } from 'lucide-react';
+import { apiFetch, apiUrl } from './lib/api';
 
 export default function App() {
   // Wizard Step: 0 = Landing, 1 = Form, 2 = Storyboard, 3 = Generating, 4 = Complete
@@ -62,7 +63,7 @@ export default function App() {
     setGlobalError('');
 
     try {
-      const res = await fetch('/api/samples/listing');
+      const res = await apiFetch('/api/samples/listing');
       if (!res.ok) {
         throw new Error(`Failed to load sample listing (HTTP ${res.status})`);
       }
@@ -149,7 +150,7 @@ export default function App() {
         image_ids: uploadedImages.map((img) => img.image_id),
       };
 
-      const res = await fetch('/api/videos/generate', {
+      const res = await apiFetch('/api/videos/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...payload, storyboard_preview: storyboard }),
@@ -186,8 +187,8 @@ export default function App() {
         location: formData.location || 'Prime Real Estate',
         duration: completedJob.metadata?.duration_seconds || formData.duration || 30,
         aspect_ratio: completedJob.metadata?.aspect_ratio || formData.aspect_ratio || '16:9',
-        stream_url: `/api/videos/${completedJob.video_id || completedJob.job_id}/stream`,
-        download_url: completedJob.download_url || `/api/videos/${completedJob.video_id}/download`,
+        stream_url: apiUrl(`/api/videos/${completedJob.video_id || completedJob.job_id}/stream`),
+        download_url: apiUrl(completedJob.download_url || `/api/videos/${completedJob.video_id}/download`),
         date: new Date().toISOString(),
       };
       // Keep most recent first, limit to 20

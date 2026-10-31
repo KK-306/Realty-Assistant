@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { apiFetch } from '../lib/api';
 import {
   Loader2,
   CheckCircle,
@@ -47,7 +48,7 @@ export default function VideoGenerating({
       if (!jobId) return;
 
       try {
-        const res = await fetch(`/api/videos/jobs/${jobId}`);
+        const res = await apiFetch(`/api/videos/jobs/${jobId}`);
         if (!res.ok) {
           throw new Error(`Failed to fetch job status (${res.status})`);
         }

@@ -1,4 +1,5 @@
 import React, { useState, useRef } from 'react';
+import { apiFetch, apiUrl } from '../lib/api';
 import {
   Upload,
   X,
@@ -191,7 +192,7 @@ export default function PropertyForm({
       formDataUpload.append('file', file);
 
       try {
-        const res = await fetch('/api/images/upload', {
+        const res = await apiFetch('/api/images/upload', {
           method: 'POST',
           body: formDataUpload,
         });
@@ -209,7 +210,7 @@ export default function PropertyForm({
               ? {
                   ...uploadedData,
                   status: 'success',
-                  preview_url: uploadedData.preview_url || localPreviewUrl,
+                  preview_url: uploadedData.preview_url ? apiUrl(uploadedData.preview_url) : localPreviewUrl,
                 }
               : img
           )
@@ -380,7 +381,7 @@ export default function PropertyForm({
       };
 
       // 1. Validate property with backend
-      const valRes = await fetch('/api/properties/validate', {
+      const valRes = await apiFetch('/api/properties/validate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -398,7 +399,7 @@ export default function PropertyForm({
       }
 
       // 2. Generate Storyboard
-      const storyRes = await fetch('/api/storyboards/generate', {
+      const storyRes = await apiFetch('/api/storyboards/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -417,7 +418,7 @@ export default function PropertyForm({
           image_id: scene.image_id,
           filename: `${scene.image_id}.png`,
           original_filename: `Gemini concept image ${index + 1}`,
-          preview_url: `/api/images/${scene.image_id}/preview`,
+          preview_url: apiUrl(`/api/images/${scene.image_id}/preview`),
           status: 'success',
           generated: true,
         }));
@@ -902,7 +903,7 @@ export default function PropertyForm({
                     {/* Image Thumbnail */}
                     <div className="aspect-video w-full bg-slate-100 overflow-hidden relative">
                       <img
-                        src={img.preview_url || `/api/images/${img.image_id}/preview`}
+                        src={img.preview_url || apiUrl(`/api/images/${img.image_id}/preview`)}
                         alt={img.filename || `Photo ${index + 1}`}
                         className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                         onError={(e) => {

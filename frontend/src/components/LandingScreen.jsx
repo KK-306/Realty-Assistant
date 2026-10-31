@@ -21,6 +21,7 @@ import {
   Sliders,
   Palette
 } from 'lucide-react';
+import { apiFetch, apiUrl } from '../lib/api';
 
 export default function LandingScreen({
   onStart,
@@ -34,11 +35,11 @@ export default function LandingScreen({
 
   // Check if a demo video is available from the backend
   useEffect(() => {
-    fetch('/api/samples/video')
+    apiFetch('/api/samples/video')
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (data?.available && data?.stream_url) {
-          setDemoVideoUrl(data.stream_url);
+          setDemoVideoUrl(apiUrl(data.stream_url));
         }
       })
       .catch(() => {

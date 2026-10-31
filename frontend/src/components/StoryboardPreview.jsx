@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { apiUrl } from '../lib/api';
 import {
   Play,
   Clock,
@@ -145,7 +146,7 @@ export default function StoryboardPreview({
     const found = uploadedImages?.find((img) => img.image_id === imageId);
     if (found?.preview_url) return found.preview_url;
     if (uploadedImages?.[index]?.preview_url) return uploadedImages[index].preview_url;
-    return `/api/images/${imageId}/preview`;
+    return apiUrl(`/api/images/${imageId}/preview`);
   };
 
   return (

@@ -435,6 +435,12 @@ Connection health is reported live on `GET /api/health`.
 
 ---
 
+## Render Frontend API Configuration
+
+When the frontend is deployed as a Render Static Site and the FastAPI backend is a separate Web Service, set `VITE_API_BASE_URL` in the frontend service's environment settings to the backend service origin, for example `https://your-backend.onrender.com` (no trailing slash). This is a Vite build-time variable, so redeploy the frontend after changing it.
+
+Leave it unset for local development; Vite's `/api` proxy will continue forwarding requests to `http://127.0.0.1:8000`.
+
 ## Configuration Reference
 
 All configuration is via environment variables (`.env` file):

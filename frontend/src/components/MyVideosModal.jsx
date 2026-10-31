@@ -13,6 +13,7 @@ import {
   RefreshCw,
   Sparkles
 } from 'lucide-react';
+import { apiFetch, apiUrl } from '../lib/api';
 
 export default function MyVideosModal({ isOpen, onClose, onCreateNew, onLoadSample }) {
   const [activeVideo, setActiveVideo] = useState(null);
@@ -43,7 +44,7 @@ export default function MyVideosModal({ isOpen, onClose, onCreateNew, onLoadSamp
       // 2. Fetch from backend server API
       let serverList = [];
       try {
-        const res = await fetch('/api/videos');
+        const res = await apiFetch('/api/videos');
         if (res.ok) {
           const data = await res.json();
           if (Array.isArray(data.videos)) {
@@ -175,7 +176,7 @@ export default function MyVideosModal({ isOpen, onClose, onCreateNew, onLoadSamp
               </div>
               <div className="aspect-video bg-black rounded-lg overflow-hidden shadow-inner border border-slate-300">
                 <video
-                  src={`/api/videos/${encodeURIComponent(activeVideo.video_id)}/stream`}
+                  src={apiUrl(`/api/videos/${encodeURIComponent(activeVideo.video_id)}/stream`)}
                   controls
                   autoPlay
                   className="w-full h-full object-contain"
@@ -282,7 +283,7 @@ export default function MyVideosModal({ isOpen, onClose, onCreateNew, onLoadSamp
                     </button>
 
                     <a
-                      href={vid.download_url || `/api/videos/${vid.video_id}/download`}
+                      href={apiUrl(vid.download_url || `/api/videos/${vid.video_id}/download`)}
                       download
                       onClick={(e) => e.stopPropagation()}
                       className="px-3 py-1.5 rounded-lg brand-gradient-btn text-white text-xs font-semibold flex items-center gap-1.5 shadow-sm"
