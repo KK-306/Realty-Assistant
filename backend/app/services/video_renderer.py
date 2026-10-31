@@ -3,11 +3,12 @@ import asyncio
 import subprocess
 import shutil
 import logging
-import math
 import re
+import time
+import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from app.config import settings
 from app.models.property import PropertyInput, VisualTheme
@@ -17,17 +18,25 @@ from app.services.audio_service import AudioService
 
 logger = logging.getLogger(__name__)
 
+
+class FFmpegExecutionError(RuntimeError):
+    def __init__(self, message: str, *, returncode: Optional[int] = None, timed_out: bool = False):
+        super().__init__(message)
+        self.returncode = returncode
+        self.timed_out = timed_out
+
 class VideoRenderer:
     @staticmethod
-    def _probe_audio_duration(audio_path: Path, ffmpeg_bin: str) -> Optional[float]:
+    def _probe_audio_duration(audio_path: Path, ffmpeg_bin: str, timeout: int = 30) -> Optional[float]:
         """Reads media duration from FFmpeg so speech can be kept inside its scene."""
         try:
-            result = subprocess.run(
-                [ffmpeg_bin, "-hide_banner", "-i", str(audio_path), "-f", "null", "-"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=30,
+            result = VideoRenderer._run_ffmpeg(
+                [
+                    ffmpeg_bin, "-hide_banner", "-loglevel", "info", "-threads", "1",
+                    "-i", str(audio_path), "-f", "null", "-",
+                ],
+                f"audio duration probe for {audio_path.name}",
+                timeout=timeout,
             )
             match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
             if not match:
@@ -35,6 +44,7 @@ class VideoRenderer:
             hours, minutes, seconds = match.groups()
             return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
         except Exception:
+            logger.warning("Could not probe audio duration for %s; using scene duration", audio_path, exc_info=True)
             return None
 
     @staticmethod
@@ -78,7 +88,8 @@ class VideoRenderer:
         scene: StoryboardScene,
         prop: PropertyInput,
         target_w: int,
-        target_h: int
+        target_h: int,
+        temp_dir: Optional[Path] = None,
     ) -> Path:
         """
         Renders a crystal-clear, high-contrast translucent graphics card with
@@ -241,45 +252,96 @@ class VideoRenderer:
             draw.text((card_x + 36, current_y), foot_str, fill=pal["footer_color"], font=font_tag)
 
         # Save transparent overlay PNG
-        temp_dir = settings.STORAGE_DIR / "temp"
+        temp_dir = temp_dir or settings.STORAGE_DIR / "temp"
         temp_dir.mkdir(parents=True, exist_ok=True)
         overlay_path = temp_dir / f"overlay_scene_{scene.scene_index}.png"
-        overlay.save(overlay_path, format="PNG")
+        try:
+            overlay.save(overlay_path, format="PNG")
+        finally:
+            overlay.close()
         return overlay_path
 
     @classmethod
-    def _prepare_base_image(cls, src_path: Path, target_w: int, target_h: int, scene_idx: int) -> Path:
+    def _prepare_base_image(
+        cls,
+        src_path: Path,
+        target_w: int,
+        target_h: int,
+        scene_idx: int,
+        temp_dir: Optional[Path] = None,
+    ) -> Path:
         """
-        Scales and center-crops the user image to the target dimensions without distortion,
-        saving as a clean temp image for FFmpeg zoompan.
+        Fits one source image to the target frame and writes a compact JPEG for FFmpeg.
         """
-        temp_dir = settings.STORAGE_DIR / "temp"
+        temp_dir = temp_dir or settings.STORAGE_DIR / "temp"
         temp_dir.mkdir(parents=True, exist_ok=True)
         out_path = temp_dir / f"base_scene_{scene_idx}.jpg"
 
-        with Image.open(src_path) as img:
-            img = img.convert("RGB")
-            src_w, src_h = img.size
-            src_ratio = src_w / src_h
-            target_ratio = target_w / target_h
-
-            if src_ratio > target_ratio:
-                # Source is wider: match height, crop width
-                new_h = target_h
-                new_w = int(target_h * src_ratio)
-            else:
-                # Source is taller: match width, crop height
-                new_w = target_w
-                new_h = int(target_w / src_ratio)
-
-            resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-            # Center crop
-            left = (new_w - target_w) // 2
-            top = (new_h - target_h) // 2
-            cropped = resized.crop((left, top, left + target_w, top + target_h))
-            cropped.save(out_path, quality=95)
+        with Image.open(src_path) as source_image:
+            # draft() lets JPEG decoders reduce large sources before full decode.
+            source_image.draft("RGB", (target_w, target_h))
+            oriented = ImageOps.exif_transpose(source_image)
+            try:
+                fitted = ImageOps.fit(
+                    oriented,
+                    (target_w, target_h),
+                    method=Image.Resampling.LANCZOS,
+                    centering=(0.5, 0.5),
+                )
+                try:
+                    fitted.save(out_path, format="JPEG", quality=84, optimize=False, progressive=False)
+                finally:
+                    fitted.close()
+            finally:
+                if oriented is not source_image:
+                    oriented.close()
 
         return out_path
+
+    @staticmethod
+    def _run_ffmpeg(command: List[str], stage: str, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+        timeout_seconds = timeout or settings.FFMPEG_COMMAND_TIMEOUT_SECONDS
+        started_at = time.monotonic()
+        logger.info("FFmpeg stage '%s' starting (timeout=%ss)", stage, timeout_seconds)
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stderr = exc.stderr or ""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
+            excerpt = stderr[-4000:]
+            logger.error("FFmpeg stage '%s' timed out after %ss: %s", stage, timeout_seconds, excerpt)
+            raise FFmpegExecutionError(
+                f"FFmpeg {stage} timed out after {timeout_seconds} seconds. {excerpt}",
+                timed_out=True,
+            ) from exc
+        except OSError as exc:
+            logger.exception("Could not start FFmpeg stage '%s' using command %s", stage, command[0])
+            raise FFmpegExecutionError(
+                f"FFmpeg {stage} could not start: {exc}",
+            ) from exc
+
+        elapsed = time.monotonic() - started_at
+        stderr = (result.stderr or "").strip()
+        if result.returncode != 0:
+            excerpt = stderr[-4000:] or "FFmpeg did not provide diagnostic output."
+            logger.error("FFmpeg stage '%s' exited %s after %.1fs: %s", stage, result.returncode, elapsed, excerpt)
+            raise FFmpegExecutionError(
+                f"FFmpeg {stage} failed with exit code {result.returncode}. {excerpt}",
+                returncode=result.returncode,
+            )
+
+        logger.info("FFmpeg stage '%s' completed in %.1fs (exit=%s)", stage, elapsed, result.returncode)
+        if stderr:
+            logger.debug("FFmpeg stage '%s' diagnostics: %s", stage, stderr[-2000:])
+        return result
 
     @classmethod
     def render_video(
@@ -298,119 +360,144 @@ class VideoRenderer:
         5. Validates final MP4 format and returns comprehensive metadata.
         """
         ffmpeg_bin = settings.get_ffmpeg_path()
-        logger.info(f"Using FFmpeg binary: {ffmpeg_bin}")
+        logger.info("Starting video render: output=%s ffmpeg=%s", output_mp4, ffmpeg_bin)
 
-        res_info = settings.RESOLUTIONS.get(prop.aspect_ratio.value, {"width": 1920, "height": 1080})
+        res_info = settings.RESOLUTIONS.get(prop.aspect_ratio.value, {"width": 1280, "height": 720})
         target_w = res_info["width"]
         target_h = res_info["height"]
-        fps = 30
+        fps = settings.RENDER_FPS
+        num_scenes = len(storyboard.scenes)
+        if num_scenes == 0:
+            raise ValueError("The storyboard has no scenes to render.")
+
+        render_started_at = time.monotonic()
+        render_deadline = render_started_at + settings.MAX_RENDER_JOB_SECONDS
+
+        def timeout_for(stage: str, stage_limit: Optional[int] = None) -> int:
+            remaining = render_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Video render exceeded its {settings.MAX_RENDER_JOB_SECONDS}-second time limit during {stage}."
+                )
+            limit = stage_limit or settings.FFMPEG_COMMAND_TIMEOUT_SECONDS
+            return max(1, min(limit, int(remaining)))
 
         temp_dir = settings.STORAGE_DIR / "temp" / f"job_{output_mp4.stem}"
         temp_dir.mkdir(parents=True, exist_ok=True)
+        output_mp4.parent.mkdir(parents=True, exist_ok=True)
+        staged_output = output_mp4.with_name(f".{output_mp4.stem}.{uuid.uuid4().hex}.partial.mp4")
 
         scene_video_clips: List[Path] = []
-        num_scenes = len(storyboard.scenes)
 
         try:
-            # Step 1: Render each scene video clip
+            logger.info(
+                "Image processing stage started: %s scenes, %sx%s at %s FPS",
+                num_scenes, target_w, target_h, fps,
+            )
             for idx, scene in enumerate(storyboard.scenes):
+                timeout_for(f"scene {idx + 1} image processing")
                 if progress_callback:
                     pct = 30 + int((idx / num_scenes) * 35)
                     progress_callback(pct, f"Rendering scene {idx + 1} of {num_scenes} ({scene.scene_type})")
 
-                # Resolve image
-                src_img_path = FileStorageService.get_image_path(scene.image_id)
-                if not src_img_path or not src_img_path.is_file():
-                    raise FileNotFoundError(f"Image for scene {idx} with ID {scene.image_id} could not be found.")
+                base_img_path = None
+                overlay_path = None
+                scene_started_at = time.monotonic()
+                try:
+                    src_img_path = FileStorageService.get_image_path(scene.image_id)
+                    if not src_img_path or not src_img_path.is_file():
+                        raise FileNotFoundError(
+                            f"Image for scene {idx + 1} with ID {scene.image_id} could not be found."
+                        )
 
-                # Prepare base image
-                base_img_path = cls._prepare_base_image(src_img_path, target_w, target_h, idx)
-                # Render overlay card
-                overlay_path = cls._create_scene_overlay(scene, prop, target_w, target_h)
+                    logger.info(
+                        "Scene %s/%s image processing started: image=%s source_bytes=%s",
+                        idx + 1, num_scenes, scene.image_id, src_img_path.stat().st_size,
+                    )
+                    base_img_path = cls._prepare_base_image(src_img_path, target_w, target_h, idx, temp_dir)
+                    overlay_path = cls._create_scene_overlay(scene, prop, target_w, target_h, temp_dir)
+                    logger.info(
+                        "Scene %s/%s image processing completed: base_bytes=%s overlay_bytes=%s elapsed=%.1fs",
+                        idx + 1,
+                        num_scenes,
+                        base_img_path.stat().st_size,
+                        overlay_path.stat().st_size,
+                        time.monotonic() - scene_started_at,
+                    )
 
-                scene_clip_path = temp_dir / f"scene_{idx}.mp4"
-                duration_frames = int(scene.duration * fps)
-
-                # Ken Burns effect: subtle zoom in from 1.0 to 1.06
-                # zoompan with overlay filter in FFmpeg
-                # For maximum reliability and speed on all FFmpeg builds:
-                # [0:v]zoompan=z='min(zoom+0.0006,1.06)':d={duration_frames}:s={target_w}x{target_h}:fps={fps}[zoomed];
-                # [zoomed][1:v]overlay=0:0[vout]
-                filter_complex = (
-                    f"[0:v]zoompan=z='min(zoom+0.0008,1.06)':d={duration_frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={target_w}x{target_h}:fps={fps}[zoomed];"
-                    f"[zoomed][1:v]overlay=0:0:shortest=1[vout]"
-                )
-
-                cmd = [
-                    ffmpeg_bin,
-                    "-y",
-                    "-loop", "1",
-                    "-t", str(scene.duration),
-                    "-i", str(base_img_path),
-                    "-loop", "1",
-                    "-t", str(scene.duration),
-                    "-i", str(overlay_path),
-                    "-filter_complex", filter_complex,
-                    "-map", "[vout]",
-                    "-c:v", "libx264",
-                    "-pix_fmt", "yuv420p",
-                    "-preset", "fast",
-                    "-r", str(fps),
-                    str(scene_clip_path)
-                ]
-
-                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                if res.returncode != 0:
-                    logger.error(f"FFmpeg scene {idx} render failed: {res.stderr}")
-                    # If zoompan had any issue on older builds, fallback to direct scale + overlay
-                    fallback_filter = f"[0:v]scale={target_w}:{target_h}[scaled];[scaled][1:v]overlay=0:0:shortest=1[vout]"
-                    fallback_cmd = [
-                        ffmpeg_bin,
-                        "-y",
-                        "-loop", "1",
-                        "-t", str(scene.duration),
-                        "-i", str(base_img_path),
-                        "-loop", "1",
-                        "-t", str(scene.duration),
-                        "-i", str(overlay_path),
-                        "-filter_complex", fallback_filter,
-                        "-map", "[vout]",
-                        "-c:v", "libx264",
-                        "-pix_fmt", "yuv420p",
-                        "-preset", "fast",
-                        "-r", str(fps),
-                        str(scene_clip_path)
+                    scene_clip_path = temp_dir / f"scene_{idx}.mp4"
+                    duration_frames = max(1, int(round(scene.duration * fps)))
+                    filter_complex = (
+                        f"[0:v]zoompan=z='min(zoom+0.0008,1.06)':d={duration_frames}:"
+                        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+                        f"s={target_w}x{target_h}:fps={fps}[zoomed];"
+                        "[zoomed][1:v]overlay=0:0:shortest=1[vout]"
+                    )
+                    thread_args = ["-filter_threads", "1", "-filter_complex_threads", "1"]
+                    codec_args = [
+                        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1",
+                        "-pix_fmt", "yuv420p", "-r", str(fps),
                     ]
-                    res2 = subprocess.run(fallback_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                    if res2.returncode != 0:
-                        raise RuntimeError(f"FFmpeg failed to render scene clip {idx}: {res2.stderr}")
-
-                scene_video_clips.append(scene_clip_path)
+                    scene_inputs = [
+                        ffmpeg_bin, "-hide_banner", "-loglevel", "warning", "-y",
+                        *thread_args,
+                        "-loop", "1", "-t", str(scene.duration), "-i", str(base_img_path),
+                        "-loop", "1", "-t", str(scene.duration), "-i", str(overlay_path),
+                        "-filter_complex", filter_complex,
+                        "-map", "[vout]", *codec_args, str(scene_clip_path),
+                    ]
+                    try:
+                        cls._run_ffmpeg(
+                            scene_inputs,
+                            f"scene {idx + 1} render",
+                            timeout=timeout_for(f"scene {idx + 1} encoding"),
+                        )
+                    except FFmpegExecutionError as first_error:
+                        if first_error.timed_out:
+                            raise
+                        logger.warning(
+                            "Ken Burns scene render failed for scene %s; trying compatibility scale path: %s",
+                            idx + 1, first_error,
+                        )
+                        fallback_filter = (
+                            f"[0:v]scale={target_w}:{target_h}[scaled];"
+                            "[scaled][1:v]overlay=0:0:shortest=1[vout]"
+                        )
+                        fallback_inputs = [
+                            ffmpeg_bin, "-hide_banner", "-loglevel", "warning", "-y",
+                            *thread_args,
+                            "-loop", "1", "-t", str(scene.duration), "-i", str(base_img_path),
+                            "-loop", "1", "-t", str(scene.duration), "-i", str(overlay_path),
+                            "-filter_complex", fallback_filter,
+                            "-map", "[vout]", *codec_args, str(scene_clip_path),
+                        ]
+                        cls._run_ffmpeg(
+                            fallback_inputs,
+                            f"scene {idx + 1} compatibility render",
+                            timeout=timeout_for(f"scene {idx + 1} compatibility encoding"),
+                        )
+                    scene_video_clips.append(scene_clip_path)
+                    logger.info(
+                        "Scene %s/%s completed in %.1fs: clip_bytes=%s",
+                        idx + 1, num_scenes, time.monotonic() - scene_started_at, scene_clip_path.stat().st_size,
+                    )
+                finally:
+                    for temporary_image in (base_img_path, overlay_path):
+                        if temporary_image is not None:
+                            temporary_image.unlink(missing_ok=True)
+                    logger.info("Released scene %s image and overlay resources", idx + 1)
 
             if progress_callback:
                 progress_callback(70, "Concatenating scenes and composing audio tracks")
 
-            # Step 2: Concatenate all scene clips into combined video
+            logger.info("Scene concatenation stage started: %s clips", len(scene_video_clips))
             concat_txt_path = temp_dir / "concat_list.txt"
             with open(concat_txt_path, "w", encoding="utf-8") as f:
                 for sc in scene_video_clips:
                     # FFmpeg concat demuxer requires forward slashes or escaped backslashes
                     clean_path = str(sc).replace("\\", "/")
                     f.write(f"file '{clean_path}'\n")
-
-            combined_video_path = temp_dir / "combined_video.mp4"
-            concat_cmd = [
-                ffmpeg_bin,
-                "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", str(concat_txt_path),
-                "-c:v", "copy",
-                str(combined_video_path)
-            ]
-            concat_res = subprocess.run(concat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if concat_res.returncode != 0:
-                raise RuntimeError(f"FFmpeg failed to concatenate scenes: {concat_res.stderr}")
+            logger.info("Scene concatenation input prepared: %s clips; no intermediate combined video created", len(scene_video_clips))
 
             # Step 3: Audio synthesis and mixing
             if progress_callback:
@@ -418,16 +505,22 @@ class VideoRenderer:
 
             voiceover_tracks: List[Tuple[Path, float, float, float]] = []
             if prop.narration_enabled and settings.TTS_PROVIDER != "none":
+                logger.info("Narration generation stage started")
                 scene_start = 0.0
                 for idx, scene in enumerate(storyboard.scenes):
                     text = scene.voiceover_text.strip()
                     if text:
                         vo_temp = temp_dir / f"voiceover_scene_{idx}.mp3"
+                        narration_started_at = time.monotonic()
+                        logger.info("Narration generation started for scene %s/%s", idx + 1, num_scenes)
                         vo_path = asyncio.run(
-                            AudioService.generate_voiceover(
-                                text,
-                                vo_temp,
-                                voice=getattr(prop, "voice_accent", None)
+                            asyncio.wait_for(
+                                AudioService.generate_voiceover(
+                                    text,
+                                    vo_temp,
+                                    voice=getattr(prop, "voice_accent", None)
+                                ),
+                                timeout=timeout_for("narration", settings.TTS_GENERATION_TIMEOUT_SECONDS),
                             )
                         )
                         if not vo_path or not vo_path.is_file() or vo_path.stat().st_size <= 500:
@@ -436,21 +529,45 @@ class VideoRenderer:
                                 f"Narration could not be generated for {selected_voice}. "
                                 "Check the internet connection or install a matching English system speech voice."
                             )
-                        audio_duration = cls._probe_audio_duration(vo_path, ffmpeg_bin) or scene.duration
+                        audio_duration = cls._probe_audio_duration(
+                            vo_path,
+                            ffmpeg_bin,
+                            timeout=timeout_for("narration audio probe", 30),
+                        ) or scene.duration
                         voiceover_tracks.append((vo_path, scene_start, audio_duration, scene.duration))
+                        logger.info(
+                            "Narration generation completed for scene %s/%s in %.1fs: bytes=%s duration=%.2fs",
+                            idx + 1, num_scenes, time.monotonic() - narration_started_at,
+                            vo_path.stat().st_size, audio_duration,
+                        )
                     scene_start += scene.duration
 
                 if not voiceover_tracks:
                     raise RuntimeError("The script has no scene narration to synthesize.")
+                logger.info("Narration generation completed: %s tracks", len(voiceover_tracks))
+            else:
+                logger.info("Narration generation skipped: narration is disabled")
 
+            logger.info(
+                "Audio mixing stage started: narration_tracks=%s music_enabled=%s",
+                len(voiceover_tracks), prop.music_enabled,
+            )
             bg_music_path = AudioService.get_background_music_path() if prop.music_enabled else None
+            if prop.music_enabled and bg_music_path:
+                logger.info("Background music available: %s (%s bytes)", bg_music_path, bg_music_path.stat().st_size)
+            elif prop.music_enabled:
+                logger.warning("Background music was requested but no bundled music file is available")
 
             # Step 4: Final Muxing
             if progress_callback:
                 progress_callback(90, "Aligning scene narration and finalizing MP4")
 
             total_dur = storyboard.total_duration
-            final_cmd = [ffmpeg_bin, "-y", "-i", str(combined_video_path)]
+            final_cmd = [
+                ffmpeg_bin, "-hide_banner", "-loglevel", "warning", "-y",
+                "-filter_threads", "1", "-filter_complex_threads", "1", "-threads", "1",
+                "-f", "concat", "-safe", "0", "-i", str(concat_txt_path),
+            ]
             voice_input_indexes = []
             for vo_path, _, _, _ in voiceover_tracks:
                 voice_input_indexes.append(1 + len(voice_input_indexes))
@@ -525,24 +642,42 @@ class VideoRenderer:
 
             final_cmd.extend([
                 "-t", str(total_dur),
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
+                "-c:v", "copy",
                 "-c:a", "aac",
+                "-threads", "1",
                 "-b:a", "192k",
                 "-movflags", "+faststart",
-                str(output_mp4)
+                str(staged_output)
             ])
 
-            final_res = subprocess.run(final_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if final_res.returncode != 0:
-                raise RuntimeError(f"FFmpeg final muxing failed: {final_res.stderr}")
+            logger.info("Audio mixing and final mux stage started")
+            cls._run_ffmpeg(final_cmd, "audio mix and final mux", timeout=timeout_for("audio mixing"))
+            logger.info("Audio mixing and final mux completed: staged_bytes=%s", staged_output.stat().st_size)
 
-            # Step 5: Validate rendered MP4
-            if not output_mp4.is_file() or output_mp4.stat().st_size < 1000:
-                raise RuntimeError("Generated MP4 file is empty or corrupted.")
+            if not staged_output.is_file() or staged_output.stat().st_size < 1000:
+                raise RuntimeError("FFmpeg exited successfully but did not create a usable MP4 output file.")
+            with staged_output.open("rb") as mp4_file:
+                mp4_header = mp4_file.read(12)
+            if len(mp4_header) < 8 or mp4_header[4:8] != b"ftyp":
+                raise RuntimeError("FFmpeg output is not a valid MP4 container (missing ftyp signature).")
+
+            cls._run_ffmpeg(
+                [
+                    ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-xerror", "-threads", "1",
+                    "-i", str(staged_output), "-f", "null", "-",
+                ],
+                "final MP4 decode validation",
+                timeout=timeout_for("final MP4 validation", 60),
+            )
+
+            os.replace(staged_output, output_mp4)
+            logger.info("Final MP4 file created and validated: %s (%s bytes)", output_mp4, output_mp4.stat().st_size)
+            for scene_clip in scene_video_clips:
+                scene_clip.unlink(missing_ok=True)
+            concat_txt_path.unlink(missing_ok=True)
+            logger.info("Released temporary scene clips and concat list")
 
             file_size = output_mp4.stat().st_size
-            logger.info(f"Successfully generated video: {output_mp4} ({file_size} bytes)")
 
             return {
                 "duration_seconds": total_dur,
@@ -554,9 +689,15 @@ class VideoRenderer:
                 "aspect_ratio": prop.aspect_ratio.value
             }
 
+        except Exception:
+            staged_output.unlink(missing_ok=True)
+            logger.exception("Video render failed for output %s", output_mp4)
+            raise
         finally:
-            # Clean up temporary directory
+            logger.info("Cleaning temporary render directory: %s", temp_dir)
             try:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception:
+                shutil.rmtree(temp_dir)
+            except FileNotFoundError:
                 pass
+            except OSError:
+                logger.exception("Could not completely clean temporary render directory %s", temp_dir)

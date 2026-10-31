@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional, Dict
 
@@ -262,30 +263,44 @@ class AudioService:
     def _wav_to_mp3(wav_path: Path, mp3_path: Path) -> bool:
         """Transcode WAV to clean broadcast-standard MP3 (44.1kHz, 192k stereo)."""
         try:
-            from app.config import settings as cfg
-
-            ffmpeg_bin = cfg.FFMPEG_PATH
-            if not ffmpeg_bin:
-                return False
+            ffmpeg_bin = settings.get_ffmpeg_path()
 
             cmd = [
                 ffmpeg_bin,
+                "-hide_banner",
+                "-loglevel", "warning",
                 "-y",
                 "-i", str(wav_path),
                 "-vn",
                 "-ar", "44100",
                 "-ac", "2",
                 "-b:a", "192k",
+                "-threads", "1",
                 str(mp3_path),
             ]
+            logger.info("FFmpeg narration audio conversion started: %s", wav_path.name)
+            started_at = time.monotonic()
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                text=True,
                 timeout=60,
             )
-            return result.returncode == 0
+            elapsed = time.monotonic() - started_at
+            if result.returncode != 0:
+                logger.error(
+                    "FFmpeg narration audio conversion failed (exit=%s, %.1fs): %s",
+                    result.returncode, elapsed, (result.stderr or "")[-3000:],
+                )
+                return False
+            logger.info("FFmpeg narration audio conversion completed in %.1fs", elapsed)
+            return True
+        except subprocess.TimeoutExpired:
+            logger.exception("FFmpeg narration audio conversion timed out for %s", wav_path)
+            return False
         except Exception:
+            logger.exception("FFmpeg narration audio conversion failed for %s", wav_path)
             return False
 
 

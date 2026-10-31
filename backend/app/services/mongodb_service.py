@@ -1,6 +1,7 @@
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 from bson import ObjectId
 
@@ -71,7 +72,7 @@ class MongoDBService:
             logger.info(f"Successfully connected to MongoDB Atlas database: '{db_name}'")
         except Exception as e:
             logger.warning(
-                "Could not connect to MongoDB Atlas (%s). Using local fallback for now; the service will retry.",
+                "Could not connect to MongoDB Atlas (%s). Persistent operations are unavailable; the service will retry.",
                 e,
             )
             self._retry_after = time.monotonic() + 5
@@ -97,10 +98,18 @@ class MongoDBService:
             if not was_connected:
                 logger.info("MongoDB Atlas connection restored.")
             return True
-        except Exception:
+        except Exception as exc:
             self._retry_after = time.monotonic() + 5
             self._connected_cache = False
+            if was_connected:
+                logger.warning("MongoDB connection was lost; retrying in 5 seconds: %s", exc)
             return False
+
+    def is_gridfs_available(self) -> bool:
+        """Return whether configured GridFS storage is currently reachable."""
+        from app.config import settings
+
+        return bool(settings.MONGODB_GRIDFS_ENABLED and self._fs is not None and self.is_connected())
 
     def get_status(self) -> Dict[str, Any]:
         from app.config import settings
@@ -162,6 +171,20 @@ class MongoDBService:
         except Exception as e:
             logger.warning(f"Failed to get job {job_id} from MongoDB: {e}")
             return None
+
+    def list_active_jobs(self) -> List[Dict[str, Any]]:
+        """Load nonterminal jobs so a new process can fail interrupted renders at startup."""
+        if not self.is_connected() or self._db is None:
+            return []
+        try:
+            cursor = self._db["jobs"].find(
+                {"status": {"$nin": ["completed", "failed"]}},
+                {"_id": 0},
+            )
+            return list(cursor)
+        except Exception as e:
+            logger.warning("Failed to load active video jobs from MongoDB: %s", e)
+            return []
 
     # =========================================================================
     # Property Input Persistence
@@ -285,6 +308,83 @@ class MongoDBService:
         except Exception as e:
             logger.warning(f"Failed to save file '{filename}' to MongoDB GridFS: {e}")
             return None
+
+    def save_path_to_gridfs(
+        self,
+        file_path: Path,
+        filename: str,
+        content_type: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        chunk_size: int = 1024 * 1024,
+    ) -> Optional[str]:
+        """Streams a local file to GridFS without creating a second full-size bytes object."""
+        if not self.is_connected() or self._fs is None:
+            return None
+
+        grid_in = None
+        try:
+            file_meta = dict(metadata or {})
+            file_meta["content_type"] = content_type
+            file_meta["uploaded_at"] = datetime.now(timezone.utc).isoformat()
+            try:
+                existing = self._fs.find_one({"filename": filename})
+                if existing:
+                    self._fs.delete(existing._id)
+            except Exception:
+                logger.debug("Could not remove an existing GridFS file named %s", filename, exc_info=True)
+
+            grid_in = self._fs.new_file(filename=filename, metadata=file_meta)
+            with file_path.open("rb") as source:
+                while chunk := source.read(chunk_size):
+                    grid_in.write(chunk)
+            grid_in.close()
+            logger.info("Streamed %s (%s bytes) to GridFS", filename, file_path.stat().st_size)
+            return str(grid_in._id)
+        except Exception as e:
+            if grid_in is not None:
+                try:
+                    grid_in.abort()
+                except Exception:
+                    pass
+            logger.warning("Failed to stream file '%s' to MongoDB GridFS: %s", filename, e)
+            return None
+
+    def copy_file_from_gridfs(self, filename_or_id: str, destination: Path, chunk_size: int = 1024 * 1024) -> bool:
+        """Copies a GridFS object to disk in bounded chunks."""
+        if not self.is_connected() or self._fs is None:
+            return False
+
+        grid_out = None
+        try:
+            if ObjectId.is_valid(filename_or_id):
+                try:
+                    grid_out = self._fs.get(ObjectId(filename_or_id))
+                except Exception:
+                    grid_out = None
+            if grid_out is None:
+                grid_out = self._fs.find_one({"filename": filename_or_id})
+            if grid_out is None:
+                return False
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("wb") as output:
+                while chunk := grid_out.read(chunk_size):
+                    output.write(chunk)
+            logger.info("Restored %s (%s bytes) from GridFS", filename_or_id, destination.stat().st_size)
+            return True
+        except Exception as e:
+            logger.warning("Failed to restore file '%s' from GridFS: %s", filename_or_id, e)
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+        finally:
+            if grid_out is not None:
+                try:
+                    grid_out.close()
+                except Exception:
+                    pass
 
     def get_file_from_gridfs(self, filename_or_id: str) -> Optional[bytes]:
         """

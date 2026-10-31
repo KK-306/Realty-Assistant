@@ -10,6 +10,8 @@ import {
   Sparkles
 } from 'lucide-react';
 
+const MAX_POLL_DURATION_MS = 30 * 60 * 1000;
+
 export default function VideoGenerating({
   jobId,
   onVideoReady,
@@ -24,6 +26,7 @@ export default function VideoGenerating({
   });
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [pollError, setPollError] = useState(null);
+  const [pollingStopped, setPollingStopped] = useState(false);
 
   // Timer ref
   const timerRef = useRef(null);
@@ -40,15 +43,36 @@ export default function VideoGenerating({
     };
   }, []);
 
-  // Poll Job Status every 2 seconds
+  // Poll job status every 2 seconds, backing off when the API is unavailable.
   useEffect(() => {
     let isCancelled = false;
+    let consecutiveFailures = 0;
+    let deadlineTimer = null;
+    let activeController = null;
+    setPollingStopped(false);
+    setPollError(null);
+
+    const schedulePoll = (delay) => {
+      if (!isCancelled) pollRef.current = setTimeout(pollJob, delay);
+    };
+
+    const stopPolling = (message) => {
+      if (isCancelled) return;
+      isCancelled = true;
+      if (pollRef.current) clearTimeout(pollRef.current);
+      if (timerRef.current) clearInterval(timerRef.current);
+      if (activeController) activeController.abort();
+      setPollingStopped(true);
+      setPollError(message);
+    };
 
     const pollJob = async () => {
-      if (!jobId) return;
+      if (!jobId || isCancelled) return;
 
+      const controller = new AbortController();
+      activeController = controller;
       try {
-        const res = await apiFetch(`/api/videos/jobs/${jobId}`);
+        const res = await apiFetch(`/api/videos/jobs/${jobId}`, { signal: controller.signal });
         if (!res.ok) {
           throw new Error(`Failed to fetch job status (${res.status})`);
         }
@@ -56,36 +80,54 @@ export default function VideoGenerating({
         const data = await res.json();
         if (isCancelled) return;
 
+        consecutiveFailures = 0;
         setJob(data);
         setPollError(null);
 
         if (data.status === 'completed') {
           if (timerRef.current) clearInterval(timerRef.current);
-          if (pollRef.current) clearInterval(pollRef.current);
+          if (deadlineTimer) clearTimeout(deadlineTimer);
+          isCancelled = true;
           // Allow user to see 100% completion briefly before advancing
           setTimeout(() => {
             onVideoReady(data);
           }, 600);
         } else if (data.status === 'failed') {
           if (timerRef.current) clearInterval(timerRef.current);
-          if (pollRef.current) clearInterval(pollRef.current);
+          if (deadlineTimer) clearTimeout(deadlineTimer);
+          isCancelled = true;
+        } else {
+          schedulePoll(2000);
         }
       } catch (err) {
-        if (!isCancelled) {
-          setPollError(err.message || 'Network error while checking status');
+        if (!isCancelled && err.name !== 'AbortError') {
+          consecutiveFailures += 1;
+          const retryDelay = Math.min(2000 * 2 ** (consecutiveFailures - 1), 15000);
+          const message = err instanceof TypeError
+            ? 'The video service is unreachable. Check the backend service and network; retrying automatically.'
+            : err.message || 'Network error while checking status';
+
+          setPollError(message);
+          schedulePoll(retryDelay);
         }
+      } finally {
+        if (activeController === controller) activeController = null;
       }
     };
 
     // Run first check immediately
-    pollJob();
-
-    // Then interval every 2000ms
-    pollRef.current = setInterval(pollJob, 2000);
+    if (jobId) {
+      deadlineTimer = setTimeout(() => {
+        stopPolling('Status polling stopped after 30 minutes. Check My Videos or refresh the page to look up this job again.');
+      }, MAX_POLL_DURATION_MS);
+      pollJob();
+    }
 
     return () => {
       isCancelled = true;
-      if (pollRef.current) clearInterval(pollRef.current);
+      if (pollRef.current) clearTimeout(pollRef.current);
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      if (activeController) activeController.abort();
     };
   }, [jobId, onVideoReady]);
 
@@ -253,7 +295,7 @@ export default function VideoGenerating({
             {/* Poll Warning Banner if any */}
             {pollError && (
               <p className="text-xs text-[#A93478] bg-rose-50 border border-rose-200 py-1.5 px-3 rounded-lg max-w-sm mx-auto">
-                Reconnecting: {pollError}
+                {pollingStopped ? pollError : `Reconnecting: ${pollError}`}
               </p>
             )}
 

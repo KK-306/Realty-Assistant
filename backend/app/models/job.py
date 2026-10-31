@@ -19,7 +19,7 @@ class OutputMetadata(BaseModel):
     height: int
     file_size_bytes: int
     format: str = "mp4"
-    fps: int = 30
+    fps: int = 24
     aspect_ratio: str
 
 class VideoJob(BaseModel):

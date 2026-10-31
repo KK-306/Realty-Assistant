@@ -1,13 +1,27 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
+from app.config import settings
 from app.models.property import PropertyInput
 from app.models.storyboard import StoryboardOutput
 from app.models.job import VideoJob
-from app.services.job_manager import job_manager
+from app.services.job_manager import job_manager, PersistentJobStoreUnavailable
 from app.services.file_storage import FileStorageService
 from app.services.mongodb_service import mongodb_service
 
 router = APIRouter(prefix="/api/videos", tags=["Videos"])
+
+
+def _persistent_storage_error(require_gridfs: bool = False) -> str | None:
+    """Explain why persistent records or media cannot currently be read/written."""
+    if settings.REQUIRE_PERSISTENT_JOB_STORE and (
+        not settings.MONGODB_URI or not settings.MONGODB_GRIDFS_ENABLED
+    ):
+        return "Persistent video storage is misconfigured; configure MONGODB_URI and enable MongoDB GridFS."
+    if settings.MONGODB_URI and not mongodb_service.is_connected():
+        return "MongoDB is temporarily unavailable; persistent video data could not be accessed."
+    if require_gridfs and not mongodb_service.is_gridfs_available():
+        return "MongoDB GridFS is unavailable; persistent video media could not be accessed."
+    return None
 
 
 class VideoGenerationRequest(PropertyInput):
@@ -25,15 +39,26 @@ def create_video_render_job(request: VideoGenerationRequest):
     if len(prop.image_ids) < 4 or len(prop.image_ids) > 8:
         raise HTTPException(status_code=400, detail="Between 4 and 8 property images are required.")
 
+    if settings.REQUIRE_PERSISTENT_JOB_STORE:
+        storage_error = _persistent_storage_error(require_gridfs=True)
+        if storage_error:
+            raise HTTPException(status_code=503, detail=storage_error)
+
     if storyboard_preview and [scene.image_id for scene in storyboard_preview.scenes] != prop.image_ids:
         raise HTTPException(status_code=400, detail="Storyboard images do not match the submitted property images.")
 
     for img_id in prop.image_ids:
         path = FileStorageService.get_image_path(img_id)
         if not path or not path.is_file():
+            storage_error = _persistent_storage_error(require_gridfs=settings.REQUIRE_PERSISTENT_JOB_STORE)
+            if storage_error:
+                raise HTTPException(status_code=503, detail=storage_error)
             raise HTTPException(status_code=400, detail=f"Image {img_id} was not found on server.")
 
-    job = job_manager.create_job(prop, storyboard_preview=storyboard_preview)
+    try:
+        job = job_manager.create_job(prop, storyboard_preview=storyboard_preview)
+    except PersistentJobStoreUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "job_id": job.job_id,
         "status": job.status.value,
@@ -48,6 +73,9 @@ def get_job_status(job_id: str):
     """
     job = job_manager.get_job(job_id)
     if not job:
+        storage_error = _persistent_storage_error(require_gridfs=settings.REQUIRE_PERSISTENT_JOB_STORE)
+        if storage_error:
+            raise HTTPException(status_code=503, detail=storage_error)
         raise HTTPException(status_code=404, detail="Job not found.")
     return job
 
@@ -59,13 +87,17 @@ def list_rendered_videos():
     """
     from app.config import OUTPUT_DIR
     import datetime
+
+    if settings.REQUIRE_PERSISTENT_JOB_STORE:
+        storage_error = _persistent_storage_error(require_gridfs=True)
+        if storage_error:
+            raise HTTPException(status_code=503, detail=storage_error)
     
     # Check MongoDB collection first
     mongo_videos = []
     if mongodb_service.is_connected():
         mongo_videos = mongodb_service.list_videos()
-
-    if mongo_videos:
+    if mongo_videos or settings.REQUIRE_PERSISTENT_JOB_STORE:
         return {"videos": mongo_videos, "count": len(mongo_videos)}
 
     # Fallback to scanning local output directory
@@ -102,6 +134,9 @@ def get_video_metadata(video_id: str):
 
     video_path = FileStorageService.get_video_path(video_id)
     if not video_path or not video_path.is_file():
+        storage_error = _persistent_storage_error(require_gridfs=settings.REQUIRE_PERSISTENT_JOB_STORE)
+        if storage_error:
+            raise HTTPException(status_code=503, detail=storage_error)
         raise HTTPException(status_code=404, detail="Video file not found.")
 
     return {
@@ -118,6 +153,9 @@ def stream_video(video_id: str):
     """
     video_path = FileStorageService.get_video_path(video_id)
     if not video_path or not video_path.is_file():
+        storage_error = _persistent_storage_error(require_gridfs=settings.REQUIRE_PERSISTENT_JOB_STORE)
+        if storage_error:
+            raise HTTPException(status_code=503, detail=storage_error)
         raise HTTPException(status_code=404, detail="Video not found.")
 
     return FileResponse(
@@ -133,6 +171,9 @@ def download_video(video_id: str):
     """
     video_path = FileStorageService.get_video_path(video_id)
     if not video_path or not video_path.is_file():
+        storage_error = _persistent_storage_error(require_gridfs=settings.REQUIRE_PERSISTENT_JOB_STORE)
+        if storage_error:
+            raise HTTPException(status_code=503, detail=storage_error)
         raise HTTPException(status_code=404, detail="Video not found.")
 
     return FileResponse(

@@ -35,6 +35,11 @@ class Settings:
     AUDIO_DIR = AUDIO_DIR
     STORAGE_DIR = STORAGE_DIR
 
+    # Uploads are normalized to a compact JPEG before they enter the render pipeline.
+    MAX_UPLOAD_IMAGE_EDGE: int = int(os.getenv("MAX_UPLOAD_IMAGE_EDGE", "1600"))
+    UPLOAD_IMAGE_JPEG_QUALITY: int = int(os.getenv("UPLOAD_IMAGE_JPEG_QUALITY", "82"))
+    MAX_UPLOAD_IMAGE_PIXELS: int = int(os.getenv("MAX_UPLOAD_IMAGE_PIXELS", "16000000"))
+
     # Server
     HOST: str = os.getenv("HOST", "0.0.0.0")
     PORT: int = int(os.getenv("PORT", "8000"))
@@ -52,6 +57,10 @@ class Settings:
         ).split(",")
         if origin.strip()
     ]
+    # Keep the production UI origin allowed even if a Render environment value
+    # overrides the local/development CORS list.
+    if "https://realty-assistant-1.onrender.com" not in CORS_ORIGINS:
+        CORS_ORIGINS.append("https://realty-assistant-1.onrender.com")
     
     # Upload limits
     MAX_IMAGE_COUNT: int = 8
@@ -62,13 +71,18 @@ class Settings:
     # Video settings
     DEFAULT_DURATION: int = 30
     ALLOWED_DURATIONS: List[int] = [20, 30, 40]
+    RENDER_FPS: int = int(os.getenv("RENDER_FPS", "24"))
+    FFMPEG_COMMAND_TIMEOUT_SECONDS: int = int(os.getenv("FFMPEG_COMMAND_TIMEOUT_SECONDS", "300"))
+    TTS_GENERATION_TIMEOUT_SECONDS: int = int(os.getenv("TTS_GENERATION_TIMEOUT_SECONDS", "90"))
+    MAX_RENDER_JOB_SECONDS: int = int(os.getenv("MAX_RENDER_JOB_SECONDS", "1800"))
+    REQUIRE_PERSISTENT_JOB_STORE: bool = os.getenv("REQUIRE_PERSISTENT_JOB_STORE", "false").lower() in ("true", "1", "yes")
     ALLOWED_ASPECT_RATIOS: List[str] = ["16:9", "9:16"]
     ALLOWED_THEMES: List[str] = ["luxury", "modern", "minimal", "elegant"]
     
     # Resolutions
     RESOLUTIONS = {
-        "16:9": {"width": 1920, "height": 1080},
-        "9:16": {"width": 1080, "height": 1920}
+        "16:9": {"width": 1280, "height": 720},
+        "9:16": {"width": 720, "height": 1280}
     }
     
     # LLM Configuration

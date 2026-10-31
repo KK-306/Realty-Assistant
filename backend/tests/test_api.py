@@ -228,13 +228,18 @@ class TestPropertyValidation:
         resp_neg = client.post("/api/properties/validate", json=payload_neg)
         assert resp_neg.status_code == 422
 
-    def test_too_few_images_returns_error(self, client, valid_property_dict):
-        """Less than 4 images should fail validation."""
+    def test_too_few_images_returns_validation_error(self, client, valid_property_dict, monkeypatch):
+        """The validation endpoint reports too few images in its ValidationResponse payload."""
+        # Gemini is configured in this developer's .env, which allows the app to generate missing images.
+        monkeypatch.setattr(settings, "LLM_PROVIDER", "template")
+        monkeypatch.setattr(settings, "LLM_API_KEY", None)
         for count in [0, 1, 2, 3]:
             payload = dict(valid_property_dict)
             payload["image_ids"] = [f"sample_img_{i}.jpg" for i in range(count)]
             resp = client.post("/api/properties/validate", json=payload)
-            assert resp.status_code == 422
+            assert resp.status_code == 200
+            assert resp.json()["valid"] is False
+            assert any("at least 4" in error for error in resp.json()["errors"])
 
     def test_too_many_images_returns_error(self, client, valid_property_dict):
         """More than 8 images should fail validation."""
@@ -350,13 +355,43 @@ class TestImageUpload:
         )
         assert response.status_code == 200
         data = response.json()
-        assert data["filename"].endswith(".png")
+        # Uploads are normalized to compressed JPEGs before entering the render pipeline.
+        assert data["filename"].endswith(".jpg")
+        assert data["stored_size_bytes"] > 0
         assert data["width"] == 400
 
         # Cleanup
         target = settings.UPLOAD_DIR / data["filename"]
         if target.is_file():
             target.unlink()
+
+    def test_upload_resizes_large_source_before_rendering(self, client):
+        """Large uploads are stored as bounded JPEGs while original dimensions remain in the response."""
+        source = Image.new("RGB", (2400, 1600), color=(105, 145, 185))
+        buffer = io.BytesIO()
+        source.save(buffer, format="JPEG", quality=95)
+        source.close()
+        image_bytes = buffer.getvalue()
+
+        response = client.post(
+            "/api/images/upload",
+            files={"file": ("large_listing_photo.jpg", image_bytes, "image/jpeg")},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        target = settings.UPLOAD_DIR / data["filename"]
+        try:
+            assert data["width"] == 2400
+            assert data["height"] == 1600
+            assert data["size_bytes"] == len(image_bytes)
+            assert data["stored_size_bytes"] < data["size_bytes"]
+            with Image.open(target) as stored_image:
+                assert stored_image.format == "JPEG"
+                assert stored_image.width <= settings.MAX_UPLOAD_IMAGE_EDGE
+                assert stored_image.height <= settings.MAX_UPLOAD_IMAGE_EDGE
+        finally:
+            target.unlink(missing_ok=True)
 
     def test_upload_invalid_file_type_returns_400(self, client):
         """Uploading a text or non-image MIME type file must be rejected with 400."""
@@ -400,9 +435,50 @@ class TestImageUpload:
 
     def test_preview_nonexistent_image_returns_404(self, client):
         """GET /api/images/{image_id}/preview for nonexistent ID should return 404."""
-        response = client.get("/api/images/00000000-0000-0000-0000-000000000000/preview")
+        from app.services.mongodb_service import mongodb_service
+        with patch.object(settings, "MONGODB_URI", None), \
+                patch.object(settings, "REQUIRE_PERSISTENT_JOB_STORE", False), \
+                patch.object(mongodb_service, "is_connected", return_value=False):
+            response = client.get("/api/images/00000000-0000-0000-0000-000000000000/preview")
         assert response.status_code == 404
         assert "Image not found" in response.json()["detail"]
+
+    def test_preview_restores_gridfs_image_when_local_file_is_missing(self, client):
+        """An uploaded image preview is restored from GridFS after local storage is cleared."""
+        from app.services.mongodb_service import mongodb_service
+
+        image_id = str(uuid.uuid4())
+        image_bytes = create_in_memory_image()
+        restored_path = settings.UPLOAD_DIR / f"{image_id}.jpg"
+
+        def restore(filename, destination):
+            if filename != f"{image_id}.jpg":
+                return False
+            destination.write_bytes(image_bytes)
+            return True
+
+        try:
+            with patch.object(settings, "MONGODB_GRIDFS_ENABLED", True), \
+                    patch.object(mongodb_service, "is_connected", return_value=True), \
+                    patch.object(mongodb_service, "copy_file_from_gridfs", side_effect=restore):
+                response = client.get(f"/api/images/{image_id}/preview")
+            assert response.status_code == 200
+            assert response.content == image_bytes
+        finally:
+            restored_path.unlink(missing_ok=True)
+
+    def test_image_preview_reports_mongodb_outage_as_503(self, client):
+        """A missing local image is an outage, not not-found, if MongoDB is unavailable."""
+        from app.services.file_storage import FileStorageService
+        from app.services.mongodb_service import mongodb_service
+
+        with patch.object(FileStorageService, "get_image_path", return_value=None), \
+                patch.object(settings, "MONGODB_URI", "mongodb://unavailable"), \
+                patch.object(settings, "REQUIRE_PERSISTENT_JOB_STORE", False), \
+                patch.object(mongodb_service, "is_connected", return_value=False):
+            response = client.get(f"/api/images/{uuid.uuid4()}/preview")
+        assert response.status_code == 503
+        assert "MongoDB is temporarily unavailable" in response.json()["detail"]
 
 
 # ============================================================================
@@ -679,6 +755,7 @@ class TestVideoJob:
 
     def test_create_video_job_missing_images_on_disk_returns_400(self, client, valid_property_dict):
         """If image IDs do not exist on the server, job creation must be rejected with 400."""
+        from app.services.mongodb_service import mongodb_service
         payload = dict(valid_property_dict)
         payload["image_ids"] = [
             "missing_file_alpha.jpg",
@@ -686,16 +763,35 @@ class TestVideoJob:
             "missing_file_gamma.jpg",
             "missing_file_delta.jpg"
         ]
-        response = client.post("/api/videos/generate", json=payload)
+        with patch.object(settings, "MONGODB_URI", None), \
+                patch.object(settings, "REQUIRE_PERSISTENT_JOB_STORE", False), \
+                patch.object(mongodb_service, "is_connected", return_value=False):
+            response = client.post("/api/videos/generate", json=payload)
         assert response.status_code == 400
         assert "was not found on server" in response.json()["detail"]
 
     def test_get_non_existent_job_returns_404(self, client):
         """GET /api/videos/jobs/{job_id} for a non-existent job ID must return 404."""
+        from app.services.mongodb_service import mongodb_service
         fake_uuid = str(uuid.uuid4())
-        response = client.get(f"/api/videos/jobs/{fake_uuid}")
+        with patch.object(settings, "MONGODB_URI", None), \
+                patch.object(settings, "REQUIRE_PERSISTENT_JOB_STORE", False), \
+                patch.object(mongodb_service, "is_connected", return_value=False):
+            response = client.get(f"/api/videos/jobs/{fake_uuid}")
         assert response.status_code == 404
         assert "Job not found" in response.json()["detail"]
+
+    def test_persistent_job_mode_rejects_mongodb_outage(self, client, valid_property_dict):
+        """Strict persistence mode must fail before queuing a memory-only render."""
+        from app.services.mongodb_service import mongodb_service
+
+        with patch.object(settings, "REQUIRE_PERSISTENT_JOB_STORE", True), \
+                patch.object(settings, "MONGODB_URI", "mongodb://unavailable"), \
+                patch.object(settings, "MONGODB_GRIDFS_ENABLED", True), \
+                patch.object(mongodb_service, "is_connected", return_value=False):
+            response = client.post("/api/videos/generate", json=valid_property_dict)
+        assert response.status_code == 503
+        assert "MongoDB is temporarily unavailable" in response.json()["detail"]
 
     def test_job_polling_returns_valid_structure(self, client, valid_property_dict):
         """Polling an active job must return the full VideoJob model schema."""
@@ -800,12 +896,58 @@ class TestVideoJob:
             if dummy_mp4_path.is_file():
                 dummy_mp4_path.unlink()
 
+    @pytest.mark.parametrize("action", ["stream", "download"])
+    def test_video_preview_and_download_restore_gridfs_when_local_file_is_missing(self, client, action):
+        """Video preview and download restore a GridFS MP4 when the Render disk has no copy."""
+        from app.services.mongodb_service import mongodb_service
+
+        video_id = str(uuid.uuid4())
+        video_bytes = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2mp41" + b"\x00" * 200
+        restored_path = settings.OUTPUT_DIR / f"{video_id}.mp4"
+
+        def restore(filename, destination):
+            if filename != f"{video_id}.mp4":
+                return False
+            destination.write_bytes(video_bytes)
+            return True
+
+        try:
+            with patch.object(settings, "MONGODB_GRIDFS_ENABLED", True), \
+                    patch.object(mongodb_service, "is_connected", return_value=True), \
+                    patch.object(mongodb_service, "copy_file_from_gridfs", side_effect=restore):
+                response = client.get(f"/api/videos/{video_id}/{action}")
+            assert response.status_code == 200
+            assert response.content == video_bytes
+            if action == "download":
+                assert "attachment" in response.headers.get("content-disposition", "")
+            else:
+                assert response.headers["content-type"] == "video/mp4"
+        finally:
+            restored_path.unlink(missing_ok=True)
+
+    def test_video_download_reports_mongodb_outage_as_503(self, client):
+        """A missing local video reports storage outage instead of an incorrect 404."""
+        from app.services.file_storage import FileStorageService
+        from app.services.mongodb_service import mongodb_service
+
+        with patch.object(FileStorageService, "get_video_path", return_value=None), \
+                patch.object(settings, "MONGODB_URI", "mongodb://unavailable"), \
+                patch.object(settings, "REQUIRE_PERSISTENT_JOB_STORE", False), \
+                patch.object(mongodb_service, "is_connected", return_value=False):
+            response = client.get(f"/api/videos/{uuid.uuid4()}/download")
+        assert response.status_code == 503
+        assert "MongoDB is temporarily unavailable" in response.json()["detail"]
+
     def test_nonexistent_video_endpoints_return_404(self, client):
         """Requesting non-existent video IDs on metadata, stream, and download must all 404."""
+        from app.services.mongodb_service import mongodb_service
         nonexistent = "missing_video_uuid_12345"
-        assert client.get(f"/api/videos/{nonexistent}").status_code == 404
-        assert client.get(f"/api/videos/{nonexistent}/stream").status_code == 404
-        assert client.get(f"/api/videos/{nonexistent}/download").status_code == 404
+        with patch.object(settings, "MONGODB_URI", None), \
+                patch.object(settings, "REQUIRE_PERSISTENT_JOB_STORE", False), \
+                patch.object(mongodb_service, "is_connected", return_value=False):
+            assert client.get(f"/api/videos/{nonexistent}").status_code == 404
+            assert client.get(f"/api/videos/{nonexistent}/stream").status_code == 404
+            assert client.get(f"/api/videos/{nonexistent}/download").status_code == 404
 
 
 # ============================================================================
@@ -813,6 +955,145 @@ class TestVideoJob:
 # ============================================================================
 
 class TestMongoDBAtlasService:
+    @pytest.mark.parametrize(
+        "gridfs_video_id, expected_status",
+        [("gridfs-object-id", JobStatus.COMPLETED), (None, JobStatus.FAILED)],
+    )
+    def test_job_only_completes_after_mp4_gridfs_persistence(
+        self, tmp_path, valid_property_dict, gridfs_video_id, expected_status
+    ):
+        """Strict persistent mode cannot report completion from a local MP4 alone."""
+        import threading
+        import app.services.job_manager as job_manager_module
+        from app.models.property import PropertyInput
+        from app.services.mongodb_service import mongodb_service
+        from app.services.job_manager import JobManager
+
+        class StoryboardStub:
+            scenes = []
+
+            @staticmethod
+            def model_dump(mode="json"):
+                return {"scenes": []}
+
+        manager = object.__new__(JobManager)
+        job_id = str(uuid.uuid4())
+        manager._jobs = {job_id: VideoJob(job_id=job_id)}
+        manager._jobs_lock = threading.RLock()
+        manager._instance_id = "test-render-instance"
+        manager._mongo_warning_logged = False
+        manager._jobs_dir = tmp_path / "jobs"
+        manager._jobs_dir.mkdir()
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        image_path = tmp_path / "image.jpg"
+        image_path.write_bytes(b"property image")
+        prop = PropertyInput(**valid_property_dict)
+        metadata = {
+            "duration_seconds": 30,
+            "width": 1280,
+            "height": 720,
+            "file_size_bytes": 2048,
+            "format": "mp4",
+            "fps": 24,
+            "aspect_ratio": "16:9",
+        }
+
+        def render(storyboard, prop, output_mp4, progress_callback):
+            output_mp4.write_bytes(b"validated mp4 payload")
+            return metadata
+
+        with patch.object(job_manager_module, "OUTPUT_DIR", output_dir), \
+                patch.object(manager, "_resolve_image_path", return_value=image_path), \
+                patch.object(job_manager_module.VideoRenderer, "render_video", side_effect=render), \
+                patch.object(settings, "REQUIRE_PERSISTENT_JOB_STORE", True), \
+                patch.object(settings, "MONGODB_GRIDFS_ENABLED", True), \
+                patch.object(mongodb_service, "is_connected", return_value=True), \
+                patch.object(mongodb_service, "save_job", return_value=True), \
+                patch.object(mongodb_service, "save_storyboard", return_value=True), \
+                patch.object(mongodb_service, "save_path_to_gridfs", return_value=gridfs_video_id) as store_video, \
+                patch.object(mongodb_service, "save_video_record", return_value=True):
+            manager._run_job(job_id, prop, StoryboardStub())
+
+        result = manager._jobs[job_id]
+        assert result.status == expected_status
+        assert store_video.call_count == 1
+        assert store_video.call_args.kwargs["file_path"].is_file()
+        if expected_status == JobStatus.COMPLETED:
+            assert result.video_id is not None
+            assert result.download_url.endswith("/download")
+        else:
+            assert result.video_id is None
+            assert "GridFS" in result.error_message
+
+    def test_restart_marks_interrupted_mongodb_jobs_failed(self):
+        """Jobs still active under another process ID are persisted as failed on startup."""
+        import threading
+        from app.services.job_manager import JobManager
+        from app.services.mongodb_service import mongodb_service
+
+        manager = object.__new__(JobManager)
+        manager._jobs = {}
+        manager._jobs_lock = threading.RLock()
+        manager._instance_id = "new-render-instance"
+        interrupted = VideoJob(
+            job_id=str(uuid.uuid4()),
+            status=JobStatus.RENDERING,
+            progress_percent=62,
+            stage_message="Rendering scene 3",
+        ).model_dump(mode="json")
+        interrupted["worker_instance_id"] = "previous-render-instance"
+        manager._persist_job = MagicMock(return_value=True)
+
+        with patch.object(mongodb_service, "is_connected", return_value=True), \
+                patch.object(mongodb_service, "list_active_jobs", return_value=[interrupted]):
+            manager._recover_interrupted_mongo_jobs()
+
+        recovered = manager._jobs[interrupted["job_id"]]
+        assert recovered.status == JobStatus.FAILED
+        assert "server restarted" in recovered.stage_message.lower()
+        assert "restarted" in recovered.error_message.lower()
+        manager._persist_job.assert_called_once_with(recovered)
+
+    def test_completed_mongodb_job_is_restored_after_restart(self, tmp_path):
+        """A terminal completed record remains readable from MongoDB in a fresh manager."""
+        import threading
+        from app.services.job_manager import JobManager
+        from app.services.mongodb_service import mongodb_service
+
+        manager = object.__new__(JobManager)
+        manager._jobs = {}
+        manager._jobs_lock = threading.RLock()
+        manager._instance_id = "new-render-instance"
+        manager._jobs_dir = tmp_path
+        completed = VideoJob(
+            job_id=str(uuid.uuid4()),
+            status=JobStatus.COMPLETED,
+            progress_percent=100,
+            stage_message="Video generation complete",
+            video_id="persistent-video-id",
+            video_url="/api/videos/persistent-video-id/stream",
+            download_url="/api/videos/persistent-video-id/download",
+            metadata=OutputMetadata(
+                duration_seconds=30,
+                width=1280,
+                height=720,
+                file_size_bytes=4096,
+                fps=24,
+                aspect_ratio="16:9",
+            ),
+        ).model_dump(mode="json")
+        completed["worker_instance_id"] = "previous-render-instance"
+
+        with patch.object(manager, "_read_local_job", return_value=None), \
+                patch.object(mongodb_service, "get_job", return_value=completed):
+            restored = manager.get_job(completed["job_id"])
+
+        assert restored is not None
+        assert restored.status == JobStatus.COMPLETED
+        assert restored.video_id == "persistent-video-id"
+        assert restored.download_url.endswith("/download")
+
     def test_health_check_includes_mongodb_status(self, client):
         """GET /api/health should report MongoDB configuration and connection status."""
         resp = client.get("/api/health")
@@ -847,18 +1128,84 @@ class TestMongoDBAtlasService:
         svc._client = MagicMock()
         svc._client.admin.command.return_value = {"ok": 1}
 
-        # Test job upsert
-        success = svc.save_job({"job_id": "test_job_1", "status": "queued"})
-        assert success is True
-        mock_db.__getitem__.assert_called()
-        
-        # Test video record upsert
-        vid_success = svc.save_video_record({"video_id": "v1", "property_name": "Test Villa"})
-        assert vid_success is True
+        # Bypass the connection retry cache: this test supplies a connected fake client.
+        with patch.object(svc, "is_connected", return_value=True):
+            # Test job upsert
+            success = svc.save_job({"job_id": "test_job_1", "status": "queued"})
+            assert success is True
+            mock_db.__getitem__.assert_called()
 
-        # Test get_job
-        mock_db["jobs"].find_one.return_value = {"_id": "mongo_id", "job_id": "test_job_1", "status": "queued"}
-        retrieved = svc.get_job("test_job_1")
-        assert retrieved is not None
-        assert retrieved["job_id"] == "test_job_1"
-        assert "_id" not in retrieved
+            # Test video record upsert
+            vid_success = svc.save_video_record({"video_id": "v1", "property_name": "Test Villa"})
+            assert vid_success is True
+
+            # Test get_job
+            mock_db["jobs"].find_one.return_value = {"_id": "mongo_id", "job_id": "test_job_1", "status": "queued"}
+            retrieved = svc.get_job("test_job_1")
+            assert retrieved is not None
+            assert retrieved["job_id"] == "test_job_1"
+            assert "_id" not in retrieved
+
+    def test_gridfs_path_upload_and_restore_are_streamed(self, tmp_path):
+        """The persistent file store uploads and restores files through bounded GridFS reads."""
+        from bson import ObjectId
+        from app.services.mongodb_service import MongoDBService
+
+        class FakeGridOut:
+            def __init__(self, record):
+                self._id = record["id"]
+                self._payload = io.BytesIO(record["payload"])
+
+            def read(self, size=-1):
+                return self._payload.read(size)
+
+            def close(self):
+                self._payload.close()
+
+        class FakeGridIn:
+            def __init__(self, fs, filename, metadata):
+                self._fs = fs
+                self._id = ObjectId()
+                self.filename = filename
+                self.metadata = metadata
+                self._payload = io.BytesIO()
+
+            def write(self, chunk):
+                self._payload.write(chunk)
+
+            def close(self):
+                self._fs.records[self.filename] = {
+                    "id": self._id,
+                    "payload": self._payload.getvalue(),
+                    "metadata": self.metadata,
+                }
+
+            def abort(self):
+                self._payload.close()
+
+        class FakeGridFS:
+            def __init__(self):
+                self.records = {}
+
+            def find_one(self, query):
+                record = self.records.get(query.get("filename"))
+                return FakeGridOut(record) if record else None
+
+            def new_file(self, filename, metadata):
+                return FakeGridIn(self, filename, metadata)
+
+        svc = MongoDBService()
+        source = tmp_path / "rendered.mp4"
+        destination = tmp_path / "restored.mp4"
+        payload = b"video-data-" * 1000
+        source.write_bytes(payload)
+        fake_fs = FakeGridFS()
+
+        with patch.object(svc, "_fs", fake_fs), patch.object(svc, "is_connected", return_value=True):
+            gridfs_id = svc.save_path_to_gridfs(source, "persistent-test.mp4", "video/mp4", chunk_size=128)
+            assert gridfs_id is not None
+            assert fake_fs.records["persistent-test.mp4"]["payload"] == payload
+            assert fake_fs.records["persistent-test.mp4"]["metadata"]["content_type"] == "video/mp4"
+            assert svc.copy_file_from_gridfs("persistent-test.mp4", destination, chunk_size=128)
+
+        assert destination.read_bytes() == payload

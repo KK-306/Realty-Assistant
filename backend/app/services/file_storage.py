@@ -1,13 +1,13 @@
-import os
-import uuid
-import shutil
+import io
 import logging
-from threading import Lock
+import uuid
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
-from PIL import Image
+from threading import Lock
+from typing import Any, BinaryIO, Dict, Optional
 
-from app.config import settings, UPLOAD_DIR, OUTPUT_DIR, SAMPLE_DIR
+from PIL import Image, ImageOps
+
+from app.config import OUTPUT_DIR, SAMPLE_DIR, UPLOAD_DIR, settings
 from app.services.mongodb_service import mongodb_service
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,12 @@ _SAMPLE_IMAGE_NAMES = (
     "6_covered_parking.jpg",
 )
 _SAMPLE_IMAGE_LOCK = Lock()
+_IMAGE_PROCESSING_LOCK = Lock()
+
+
+class PersistentFileStoreUnavailable(RuntimeError):
+    """Raised when the deployment requires an image to exist in GridFS."""
+
 
 class FileStorageService:
     @staticmethod
@@ -28,64 +34,124 @@ class FileStorageService:
 
     @classmethod
     def validate_and_save_image(cls, file_bytes: bytes, original_filename: str, content_type: str) -> Dict[str, Any]:
-        """
-        Validates image content using PIL to guard against corrupted files,
-        file spoofing, and excessive dimensions, then saves with a secure UUID.
-        """
-        # Size validation
-        size_mb = len(file_bytes) / (1024 * 1024)
-        if size_mb > settings.MAX_FILE_SIZE_MB:
-            raise ValueError(f"File size ({size_mb:.1f}MB) exceeds maximum allowed limit of {settings.MAX_FILE_SIZE_MB}MB.")
+        """Compatibility wrapper for callers that already hold image bytes."""
+        return cls.validate_and_save_image_stream(io.BytesIO(file_bytes), original_filename, content_type)
 
+    @classmethod
+    def validate_and_save_image_stream(
+        cls,
+        source: BinaryIO,
+        original_filename: str,
+        content_type: str,
+        chunk_size: int = 1024 * 1024,
+    ) -> Dict[str, Any]:
+        """Stage, validate, resize and compress an upload without buffering it in RAM."""
         if not cls.is_allowed_mime(content_type):
             raise ValueError(f"Unsupported image MIME type: {content_type}. Only JPEG, PNG, and WebP are supported.")
 
-        # Content validation with PIL (verifies actual image integrity and dimensions)
-        import io
-        try:
-            with Image.open(io.BytesIO(file_bytes)) as img:
-                img.verify()  # Verifies image integrity
-            # Reopen to read metadata (verify closes the image)
-            with Image.open(io.BytesIO(file_bytes)) as img:
-                width, height = img.size
-                image_format = (img.format or "JPEG").lower()
-                if image_format == "jpeg":
-                    ext = ".jpg"
-                elif image_format == "png":
-                    ext = ".png"
-                elif image_format == "webp":
-                    ext = ".webp"
-                else:
-                    ext = ".jpg"
-                    
-                if width < 300 or height < 300:
-                    raise ValueError(f"Image resolution {width}x{height} is too small. Minimum resolution is 300x300.")
-        except Exception as e:
-            if "Image resolution" in str(e) or "File size" in str(e) or "Unsupported" in str(e):
-                raise
-            raise ValueError("Uploaded file is corrupted or not a valid image.")
-
-        # Generate safe unique ID and path
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        staged_path = UPLOAD_DIR / f".upload-{uuid.uuid4().hex}.tmp"
         image_id = str(uuid.uuid4())
-        safe_filename = f"{image_id}{ext}"
-        destination_path = UPLOAD_DIR / safe_filename
+        destination_path = UPLOAD_DIR / f"{image_id}.jpg"
+        source_size = 0
+        width = height = 0
 
-        with open(destination_path, "wb") as f:
-            f.write(file_bytes)
+        try:
+            with staged_path.open("wb") as staged:
+                while chunk := source.read(chunk_size):
+                    source_size += len(chunk)
+                    if source_size > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
+                        size_mb = source_size / (1024 * 1024)
+                        raise ValueError(
+                            f"File size ({size_mb:.1f}MB) exceeds maximum allowed limit of "
+                            f"{settings.MAX_FILE_SIZE_MB}MB."
+                        )
+                    staged.write(chunk)
 
-        # Also persist to MongoDB GridFS if connected
+            with _IMAGE_PROCESSING_LOCK:
+                with Image.open(staged_path) as image:
+                    width, height = image.size
+                    image_format = (image.format or "").upper()
+                    if image_format not in {"JPEG", "PNG", "WEBP"}:
+                        raise ValueError("Uploaded file is corrupted or not a supported JPEG, PNG, or WebP image.")
+                    if width < 300 or height < 300:
+                        raise ValueError(f"Image resolution {width}x{height} is too small. Minimum resolution is 300x300.")
+                    if width * height > settings.MAX_UPLOAD_IMAGE_PIXELS:
+                        raise ValueError(
+                            f"Image dimensions {width}x{height} exceed the maximum supported pixel count "
+                            f"({settings.MAX_UPLOAD_IMAGE_PIXELS:,})."
+                        )
+                    image.verify()
+
+                with Image.open(staged_path) as source_image:
+                    oriented = ImageOps.exif_transpose(source_image)
+                    try:
+                        oriented.thumbnail(
+                            (settings.MAX_UPLOAD_IMAGE_EDGE, settings.MAX_UPLOAD_IMAGE_EDGE),
+                            Image.Resampling.LANCZOS,
+                        )
+                        if "A" in oriented.getbands() or "transparency" in oriented.info:
+                            rgba = oriented.convert("RGBA")
+                            alpha = rgba.getchannel("A")
+                            normalized = Image.new("RGB", rgba.size, (255, 255, 255))
+                            try:
+                                normalized.paste(rgba, mask=alpha)
+                            finally:
+                                alpha.close()
+                                rgba.close()
+                        else:
+                            normalized = oriented.convert("RGB")
+                        try:
+                            normalized.save(
+                                destination_path,
+                                format="JPEG",
+                                quality=settings.UPLOAD_IMAGE_JPEG_QUALITY,
+                                optimize=False,
+                                progressive=False,
+                            )
+                        finally:
+                            normalized.close()
+                    finally:
+                        if oriented is not source_image:
+                            oriented.close()
+        except ValueError:
+            destination_path.unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            destination_path.unlink(missing_ok=True)
+            if "DecompressionBomb" in type(exc).__name__:
+                raise ValueError("Image dimensions are too large to process safely.") from exc
+            raise ValueError("Uploaded file is corrupted or not a valid image.") from exc
+        finally:
+            staged_path.unlink(missing_ok=True)
+
+        if not destination_path.is_file() or destination_path.stat().st_size == 0:
+            raise ValueError("The uploaded image could not be normalized for rendering.")
+
+        safe_filename = destination_path.name
+        stored_size = destination_path.stat().st_size
+        logger.info(
+            "Normalized uploaded image %s: %sx%s source_bytes=%s stored_bytes=%s",
+            image_id, width, height, source_size, stored_size,
+        )
         gridfs_id = None
         if mongodb_service.is_connected() and settings.MONGODB_GRIDFS_ENABLED:
-            gridfs_id = mongodb_service.save_file_to_gridfs(
-                file_bytes=file_bytes,
+            gridfs_id = mongodb_service.save_path_to_gridfs(
+                file_path=destination_path,
                 filename=safe_filename,
-                content_type=content_type,
+                content_type="image/jpeg",
                 metadata={
                     "image_id": image_id,
                     "original_filename": original_filename,
                     "width": width,
-                    "height": height
-                }
+                    "height": height,
+                    "stored_size_bytes": stored_size,
+                },
+            )
+        if settings.REQUIRE_PERSISTENT_JOB_STORE and not gridfs_id:
+            destination_path.unlink(missing_ok=True)
+            raise PersistentFileStoreUnavailable(
+                "The image could not be stored in MongoDB GridFS, which is required by this deployment."
             )
 
         return {
@@ -94,66 +160,65 @@ class FileStorageService:
             "original_filename": original_filename,
             "width": width,
             "height": height,
-            "size_bytes": len(file_bytes),
+            "size_bytes": source_size,
+            "stored_size_bytes": stored_size,
             "preview_url": f"/api/images/{image_id}/preview",
-            "gridfs_id": gridfs_id
+            "gridfs_id": gridfs_id,
         }
 
     @classmethod
+    def _restore_gridfs_file(cls, filename: str, destination: Path) -> bool:
+        temporary_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
+        try:
+            if not mongodb_service.copy_file_from_gridfs(filename, temporary_path):
+                return False
+            temporary_path.replace(destination)
+            return True
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    @classmethod
     def get_image_path(cls, image_id: str) -> Optional[Path]:
-        """
-        Returns the absolute Path of an image by image_id, preventing directory traversal.
-        If file is missing locally but stored in MongoDB GridFS, it recovers/caches it locally.
-        """
+        """Resolve an uploaded, sample, or GridFS-backed image without a byte buffer."""
         safe_id = Path(image_id).name
-        # Check standard upload extensions on local disk
-        for ext in [".jpg", ".jpeg", ".png", ".webp"]:
+        for ext in (".jpg", ".jpeg", ".png", ".webp"):
             candidate = UPLOAD_DIR / f"{safe_id}{ext}"
             if candidate.is_file():
                 return candidate
-                
-        # Also check if it refers to a sample image
+
         sample_file = SAMPLE_DIR / safe_id
         if sample_file.is_file():
             return sample_file
 
-        # Check if stored in MongoDB GridFS
         if mongodb_service.is_connected() and settings.MONGODB_GRIDFS_ENABLED:
-            for ext in [".jpg", ".jpeg", ".png", ".webp", ""]:
-                test_filename = f"{safe_id}{ext}" if not safe_id.endswith(ext) else safe_id
-                data = mongodb_service.get_file_from_gridfs(test_filename)
-                if data:
-                    ext_to_use = ext or ".jpg"
-                    recovered_path = UPLOAD_DIR / f"{safe_id}{ext_to_use}"
-                    with open(recovered_path, "wb") as f:
-                        f.write(data)
+            filenames = [safe_id] if Path(safe_id).suffix else [f"{safe_id}{ext}" for ext in (".jpg", ".jpeg", ".png", ".webp")]
+            for filename in filenames:
+                ext = Path(filename).suffix or ".jpg"
+                recovered_path = UPLOAD_DIR / f"{Path(filename).stem}{ext}"
+                if cls._restore_gridfs_file(filename, recovered_path):
                     return recovered_path
-            
         return None
 
     @classmethod
     def get_sample_images(cls) -> list[Dict[str, Any]]:
-        """
-        Returns metadata for pre-bundled demonstration images.
-        """
+        """Return metadata for pre-bundled demonstration images."""
         cls.ensure_sample_images()
-        sample_files = sorted(SAMPLE_DIR.glob("*.jpg"))
         results = []
-        for sf in sample_files:
+        for sample_file in sorted(SAMPLE_DIR.glob("*.jpg")):
             try:
-                with Image.open(sf) as img:
-                    w, h = img.size
+                with Image.open(sample_file) as image:
+                    width, height = image.size
                 results.append({
-                    "image_id": sf.name,
-                    "filename": sf.name,
-                    "original_filename": sf.stem.replace("_", " ").title() + ".jpg",
-                    "width": w,
-                    "height": h,
-                    "size_bytes": sf.stat().st_size,
-                    "preview_url": f"/sample-properties/{sf.name}"
+                    "image_id": sample_file.name,
+                    "filename": sample_file.name,
+                    "original_filename": sample_file.stem.replace("_", " ").title() + ".jpg",
+                    "width": width,
+                    "height": height,
+                    "size_bytes": sample_file.stat().st_size,
+                    "preview_url": f"/sample-properties/{sample_file.name}",
                 })
             except Exception:
-                continue
+                logger.warning("Could not read sample image metadata for %s", sample_file, exc_info=True)
         return results
 
     @classmethod
@@ -180,13 +245,7 @@ class FileStorageService:
         if candidate.is_file():
             return candidate
 
-        # Check if stored in MongoDB GridFS
         if mongodb_service.is_connected() and settings.MONGODB_GRIDFS_ENABLED:
-            video_filename = f"{safe_id}.mp4"
-            data = mongodb_service.get_file_from_gridfs(video_filename)
-            if data:
-                with open(candidate, "wb") as f:
-                    f.write(data)
+            if cls._restore_gridfs_file(f"{safe_id}.mp4", candidate):
                 return candidate
-
         return None

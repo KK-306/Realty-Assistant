@@ -352,11 +352,12 @@ User Input → Validation → Script Generation → Storyboard → Video Renderi
    - Calculates per-scene duration so total matches requested duration
    - Generates theme-specific overlay data (tags, badges, colors)
 
-4. **Scene Rendering** (FFmpeg per scene):
-   - Scale and center-crop image to target resolution (1920×1080 or 1080×1920)
+4. **Scene Rendering** (one scene at a time):
+   - Uploaded photos are resized to a 1600-pixel maximum edge and JPEG quality 82 before rendering
+   - The default landscape output is 1280×720 at 24 FPS; vertical output is 720×1280
    - Apply Ken Burns zoom effect (1.0→1.06 scale over duration)
-   - Composite translucent overlay card with PIL-rendered typography
-   - Encode to H.264 clip
+   - Composite the existing translucent overlay card with PIL-rendered typography
+   - Encode H.264 with FFmpeg's `ultrafast` preset and one thread, then release image intermediates
 
 5. **Audio Generation**:
    - Voiceover via Edge TTS (if narration enabled)
@@ -365,10 +366,10 @@ User Input → Validation → Script Generation → Storyboard → Video Renderi
    - Fade in/out on music
 
 6. **Final Muxing**:
-   - Concatenate all scene clips
-   - Mux video + mixed audio
-   - H.264 video, AAC audio, MP4 container with `faststart` flag
-   - Validate output file integrity
+   - Concatenate the scene clips and remove the individual clips
+   - Mix narration and ambient music, then mux AAC audio with the already-encoded H.264 video
+   - Write to a temporary MP4, check its container signature, and decode it with FFmpeg before publishing the final file
+   - FFmpeg stages have timeouts; a nonzero exit or invalid output marks the job failed with diagnostic details
 
 ---
 
@@ -398,13 +399,13 @@ User Input → Validation → Script Generation → Storyboard → Video Renderi
 
 ```
 LLM Script → Template Script (if LLM fails)
-Edge TTS → Silent video (if TTS fails)
+Edge TTS → local speech fallback → failed job with an error if narration still cannot be generated
 Ken Burns → Simple scale (if FFmpeg zoompan fails)
 Background music → No music (if WAV not found)
-MongoDB Atlas (GridFS & Metadata) → Local storage & in-memory jobs (if unconfigured/offline)
+MongoDB Atlas (GridFS & Metadata) → Local file checkpoints (if unconfigured/offline)
 ```
 
-The application always produces a valid MP4 and maintains full functionality, even with all external services or databases unavailable.
+If an external service or FFmpeg fails, the job reports a failure instead of claiming a video was created.
 
 ---
 
@@ -418,11 +419,15 @@ RA Property Studio AI includes enterprise storage support for **MongoDB Atlas** 
   - `properties`: Persists submitted property inputs and parameters.
   - `storyboards`: Archives generated scene sequences and overlay text.
 - **GridFS Binary Storage**:
-  - Automatically stores uploaded property photos and rendered MP4 promotional videos directly in Atlas GridFS when configured.
-  - Supports chunked storage, making it suitable for high-definition video files.
-  - Built-in caching: assets stored in GridFS are transparently streamed or downloaded to local disk as needed.
-- **Graceful Fallback**:
-  - If `MONGODB_URI` is not set or network is unreachable, the system automatically falls back to local disk storage (`storage/uploads`, `storage/outputs`) and in-memory job dictionaries.
+  - Stores normalized property photos and rendered MP4s in Atlas GridFS when configured, streaming files in 1 MB chunks.
+  - GridFS-backed assets are restored to local disk in bounded chunks when requested.
+- **Job checkpoints**:
+  - Job status is atomically written under `backend/storage/jobs/` and mirrored to MongoDB when available.
+  - Startup marks nonterminal jobs found in local checkpoints and reachable MongoDB records as `failed` with a retry message. In-process worker threads cannot resume a render after their server process exits.
+  - Local checkpoints survive a process restart only while the filesystem remains. Render Free storage is ephemeral and may be cleared on deploy or instance replacement.
+  - When a requested image, video, or job cannot be read because MongoDB is unavailable, the API returns HTTP 503 so storage outages are not reported as missing files.
+
+For Render, configure `MONGODB_URI` and `MONGODB_GRIDFS_ENABLED=true`. Set `REQUIRE_PERSISTENT_JOB_STORE=true` to reject new render jobs with HTTP 503 when MongoDB/GridFS is unavailable; successful jobs also require the MP4 to be stored in GridFS. Without this setting, the app logs when it has fallen back to local checkpoints, which are not durable across Render instance replacement.
 
 To enable MongoDB Atlas, add your connection string to `.env`:
 ```env
@@ -458,6 +463,14 @@ All configuration is via environment variables (`.env` file):
 | `MONGODB_URI` | (empty) | MongoDB Atlas connection string (`mongodb+srv://...`) |
 | `MONGODB_DB_NAME` | `ra_property_studio` | MongoDB database name |
 | `MONGODB_GRIDFS_ENABLED` | `true` | Enable GridFS binary storage for images & MP4s |
+| `REQUIRE_PERSISTENT_JOB_STORE` | `false` | Require reachable MongoDB/GridFS before accepting a render and before marking its MP4 complete |
+| `MAX_UPLOAD_IMAGE_EDGE` | `1600` | Maximum width or height stored for an uploaded photo |
+| `UPLOAD_IMAGE_JPEG_QUALITY` | `82` | JPEG quality used for normalized upload images |
+| `MAX_UPLOAD_IMAGE_PIXELS` | `16000000` | Reject images above this source pixel count |
+| `RENDER_FPS` | `24` | Output frame rate |
+| `FFMPEG_COMMAND_TIMEOUT_SECONDS` | `300` | Per-command FFmpeg timeout |
+| `TTS_GENERATION_TIMEOUT_SECONDS` | `90` | Per-scene narration generation timeout |
+| `MAX_RENDER_JOB_SECONDS` | `1800` | Total renderer time limit per job |
 | `CORS_ORIGINS` | Includes the deployed frontend and local development origins | Comma-separated browser origins allowed to call the backend |
 | `HOST` | `0.0.0.0` | Server bind host |
 | `PORT` | `8000` | Server bind port |
@@ -552,7 +565,16 @@ Error: connect ECONNREFUSED 127.0.0.1:8000
 
 ### Video rendering takes too long
 
-Video rendering is CPU-intensive. A 30-second video with 6 scenes typically takes 30–90 seconds depending on hardware. The progress indicator shows real-time status.
+The renderer uses one worker, 720p/24 FPS output, `ultrafast`, and one FFmpeg thread to reduce memory and CPU use. Render Free's 0.1 CPU can still make jobs take substantially longer than on a development machine. The UI polls for up to 30 minutes; FFmpeg commands fail with a logged timeout rather than hanging indefinitely.
+
+To run the small four-image, 15-second render check against the same renderer settings:
+
+```bash
+cd backend
+python -m tests.render_smoke
+```
+
+The check uses bundled sample photos and music, disables network narration, validates the finished MP4 by decoding it, and removes the output afterward. It verifies this profile on the machine where it runs; run it on the Render instance to measure that instance's actual resource limits.
 
 ### Unicode/emoji in property details
 
@@ -562,10 +584,10 @@ The renderer handles Unicode text safely. However, some special characters may n
 
 ## Known Limitations
 
-1. **In-memory job storage**: Video jobs are stored in memory and lost on server restart. A production deployment would use a database or Redis.
-2. **Single-server**: The background thread pool (3 workers) runs on the same process. Not suitable for high-concurrency production use.
-3. **FFmpeg 4.2.2**: The bundled FFmpeg via imageio-ffmpeg is v4.2.2. Some advanced filter features require newer versions.
-4. **Edge TTS requires internet**: Voiceover generation needs network access. Falls back gracefully to silent video.
+1. **Single-process job workers**: Rendering is serialized in one thread. A server restart stops the active render; MongoDB or the local checkpoint retains the failure state, but rendering is not resumed automatically. Multi-instance deployments need an external queue/worker service and shared media storage.
+2. **Render Free filesystem**: Local uploads, outputs, and job JSON files are not durable across deploys or instance replacement. Use MongoDB Atlas/GridFS or another persistent file store for production.
+3. **FFmpeg build**: The configured FFmpeg executable must include `libx264`, AAC, and the filters used for motion and audio mixing.
+4. **Edge TTS requires internet**: Voiceover generation needs network access. If the local speech fallback also fails, the job reports a narration error.
 5. **No persistent file cleanup**: Generated videos accumulate in `backend/storage/outputs/`. Manual cleanup or a cron job is recommended for long-running deployments.
 6. **No user authentication**: The application is designed for single-user local use. No auth layer is implemented.
 7. **Font availability**: Text rendering quality depends on system fonts (Segoe UI on Windows, DejaVu Sans on Linux).
