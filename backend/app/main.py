@@ -19,15 +19,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS Middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Global Exception Handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -54,3 +45,13 @@ def root():
         "docs_url": "/docs",
         "health_url": "/api/health"
     }
+
+# Wrap the complete FastAPI app so CORS headers are also included on errors
+# produced by the ASGI exception handler or by an unhandled route exception.
+app = CORSMiddleware(
+    app=app,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)

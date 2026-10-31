@@ -458,6 +458,7 @@ All configuration is via environment variables (`.env` file):
 | `MONGODB_URI` | (empty) | MongoDB Atlas connection string (`mongodb+srv://...`) |
 | `MONGODB_DB_NAME` | `ra_property_studio` | MongoDB database name |
 | `MONGODB_GRIDFS_ENABLED` | `true` | Enable GridFS binary storage for images & MP4s |
+| `CORS_ORIGINS` | Includes the deployed frontend and local development origins | Comma-separated browser origins allowed to call the backend |
 | `HOST` | `0.0.0.0` | Server bind host |
 | `PORT` | `8000` | Server bind port |
 
