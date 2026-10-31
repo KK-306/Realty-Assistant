@@ -64,6 +64,7 @@ def serve_sample_image(filename: str):
     """
     Serves bundled sample images safely.
     """
+    FileStorageService.ensure_sample_images()
     safe_name = Path(filename).name
     img_path = SAMPLE_DIR / safe_name
     if not img_path.is_file():

@@ -1,12 +1,25 @@
 import os
 import uuid
 import shutil
+import logging
+from threading import Lock
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 from PIL import Image
 
 from app.config import settings, UPLOAD_DIR, OUTPUT_DIR, SAMPLE_DIR
 from app.services.mongodb_service import mongodb_service
+
+logger = logging.getLogger(__name__)
+_SAMPLE_IMAGE_NAMES = (
+    "1_exterior_facade.jpg",
+    "2_living_room.jpg",
+    "3_modular_kitchen.jpg",
+    "4_master_bedroom.jpg",
+    "5_private_balcony.jpg",
+    "6_covered_parking.jpg",
+)
+_SAMPLE_IMAGE_LOCK = Lock()
 
 class FileStorageService:
     @staticmethod
@@ -123,6 +136,7 @@ class FileStorageService:
         """
         Returns metadata for pre-bundled demonstration images.
         """
+        cls.ensure_sample_images()
         sample_files = sorted(SAMPLE_DIR.glob("*.jpg"))
         results = []
         for sf in sample_files:
@@ -141,6 +155,23 @@ class FileStorageService:
             except Exception:
                 continue
         return results
+
+    @classmethod
+    def ensure_sample_images(cls) -> None:
+        """Regenerate bundled demo images if a deployment omitted the binaries."""
+        if all((SAMPLE_DIR / name).is_file() for name in _SAMPLE_IMAGE_NAMES):
+            return
+
+        with _SAMPLE_IMAGE_LOCK:
+            if all((SAMPLE_DIR / name).is_file() for name in _SAMPLE_IMAGE_NAMES):
+                return
+            try:
+                from app.assets.generate_assets import generate_sample_images
+
+                logger.warning("Demo images are missing; generating sample images on this instance.")
+                generate_sample_images()
+            except Exception:
+                logger.exception("Could not generate missing demo images.")
 
     @classmethod
     def get_video_path(cls, video_id: str) -> Optional[Path]:
